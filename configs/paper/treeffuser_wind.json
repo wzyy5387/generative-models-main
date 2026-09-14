@@ -1,0 +1,16 @@
+{
+  "model": "treeffuser",
+  "tag": "wind",
+  "tree_n_repeats": 5,
+  "tree_n_estimators": 500,
+  "tree_early_stopping_rounds": 50,
+  "tree_eval_percent": 0.1,
+  "tree_num_leaves": 31,
+  "tree_learning_rate": 0.1,
+  "tree_n_jobs": 4,
+  "tree_sde": "vesde",
+  "tree_sampling_steps": 50,
+  "tree_n_parallel": 10,
+  "n_scenarios": 100,
+  "scenario_splits": ["VS", "TEST"]
+}

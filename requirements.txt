@@ -1,0 +1,23 @@
+# https://github.com/AWehenkel/Normalizing-Flows -> needs to be installed to access repositories lib and models
+pandas
+numpy
+matplotlib
+scikit-learn==1.5.0
+seaborn
+jupyter
+torch
+umnn
+networkx
+statsmodels
+numpyencoder
+sns
+copulas
+wandb
+plotly
+kaleido
+tqdm
+xlrd
+nflows
+diffusers
+pytest
+treeffuser==0.2.0

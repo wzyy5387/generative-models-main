@@ -1,0 +1,16 @@
+# Python caches and local test artifacts
+__pycache__/
+*.py[cod]
+.pytest_cache/
+
+# Generated experiments, model checkpoints, and scenario outputs
+export/
+outputs/
+*.pickle
+*.pt
+*.npz
+*.npy
+*.log
+
+# Local datasets (download/build them with the scripts in GEFcom2014/)
+GEFcom2014/data/

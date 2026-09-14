@@ -1,0 +1,17 @@
+{
+  "model": "d3u",
+  "tag": "opsd-wind",
+  "dataset_bundle": "GEFcom2014/data/external/opsd_wind_daily.npz",
+  "epochs": 200,
+  "anchor_epochs": 100,
+  "anchor_hidden_dim": 256,
+  "anchor_layers": 2,
+  "hidden_dim": 128,
+  "patch_size": 4,
+  "depth": 3,
+  "heads": 4,
+  "diffusion_steps": 100,
+  "inference_steps": 50,
+  "n_scenarios": 100,
+  "scenario_splits": ["VS", "TEST"]
+}
