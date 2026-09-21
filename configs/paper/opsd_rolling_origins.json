@@ -1,0 +1,96 @@
+{
+  "protocol_version": "opsd-rolling-origin-v1",
+  "method_name": "FA-BM-VAE",
+  "dataset": "OPSD wind",
+  "dataset_bundle": "GEFcom2014/data/external/opsd_wind_daily.npz",
+  "split_rule": "expanding LS, fixed chronological VS and TEST windows; no random split",
+  "origins": [
+    {
+      "origin_id": "origin_1",
+      "ls_start": "2016-01-01",
+      "ls_end": "2017-11-06",
+      "ls_days": 676,
+      "vs_start": "2017-11-07",
+      "vs_end": "2018-02-04",
+      "test_start": "2018-02-05",
+      "test_end": "2018-05-05"
+    },
+    {
+      "origin_id": "origin_2",
+      "ls_start": "2016-01-01",
+      "ls_end": "2018-05-05",
+      "ls_days": 856,
+      "vs_start": "2018-05-06",
+      "vs_end": "2018-08-03",
+      "test_start": "2018-08-04",
+      "test_end": "2018-11-01"
+    },
+    {
+      "origin_id": "origin_3",
+      "ls_start": "2016-01-01",
+      "ls_end": "2018-11-01",
+      "ls_days": 1036,
+      "vs_start": "2018-11-02",
+      "vs_end": "2019-01-30",
+      "test_start": "2019-01-31",
+      "test_end": "2019-04-30"
+    }
+  ],
+  "models": ["FA-BM-VAE", "Forecast-anchored Gaussian", "GMM-4", "Score-SDE"],
+  "seeds": [0, 1, 2, 3, 4],
+  "n_scenarios": 100,
+  "metrics": ["CRPS_raw", "Energy", "Variogram", "ramp_CRPS", "PICP90", "interval_width90", "MAQCE"],
+  "primary_metric": "CRPS_raw",
+  "ecc_sensitivity": ["raw", "temporal_ecc"],
+  "analysis_modes": {
+    "primary": "raw",
+    "calibrated": {
+      "status": "PRE_REGISTERED_SENSITIVITY",
+      "fit_data": "LS/VS only",
+      "test_used_for_fit": false
+    },
+    "temporal_ecc": {
+      "status": "PRE_REGISTERED_SENSITIVITY",
+      "template": "model-independent pooled LS/VS rank template",
+      "fit_data": "LS/VS only",
+      "test_used_for_fit": false,
+      "fa_bm_template": "separate additional sensitivity only"
+    }
+  },
+  "training": {
+    "pilot": {
+      "epochs": {"FA-BM-VAE": 3, "Forecast-anchored Gaussian": 3, "GMM-4": 3, "Score-SDE": 3},
+      "score_sampling_steps": 4,
+      "device": "cpu",
+      "eligible_for_paper": false
+    },
+    "formal": {
+      "epochs": {"FA-BM-VAE": 80, "Forecast-anchored Gaussian": 80, "GMM-4": 80, "Score-SDE": 200},
+      "score_sampling_steps": 32,
+      "device": "auto",
+      "negative_phase_backend": "internal",
+      "sampler": "sa",
+      "eligible_for_paper": true
+    }
+  },
+  "provenance": {
+    "record_dataset_sha256": true,
+    "record_config_sha256": true,
+    "record_git_commit": true,
+    "record_environment_versions": true,
+    "record_result_sha256": true
+  },
+  "selection_data": "LS/VS only; TEST is final evaluation only",
+  "statistics": {
+    "bootstrap": "95% paired continuous-time block bootstrap; 7-day primary, 14-day sensitivity",
+    "block_lengths_days": [7, 14],
+    "paired_test": "two-sided paired sign-flip permutation",
+    "effect_size": "paired Cohen d",
+    "multiple_comparison": "Holm correction within each metric family",
+    "bootstrap_repetitions": 2000,
+    "permutation_repetitions": 2000,
+    "seed": 2026
+  },
+  "formal_run_status": "NOT RUN",
+  "test_peeking": false
+}

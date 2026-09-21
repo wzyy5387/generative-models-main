@@ -1,0 +1,79 @@
+{
+  "protocol_version": "fa-bm-vae-kaiwu-13k-v1",
+  "method_name": "FA-BM-VAE",
+  "model": {
+    "track": "wind",
+    "model_name": "wind_QBMVAE_2_lanchor_sa_0",
+    "checkpoint": "export/qbm_vae_wind/wind_QBMVAE_2_lanchor_sa_0.pickle",
+    "model_config": "export/qbm_vae_wind/wind_QBMVAE_2_lanchor_sa_0.json",
+    "anchor_checkpoint": "export/qbm_vae_wind/wind_QBMVAE_2_lanchor_sa_0_anchor.pt",
+    "training_backend": "classical",
+    "sampling_stage": "post_training_conditional_ising_latent_only"
+  },
+  "dataset": {
+    "name": "GEFCom2014 wind",
+    "source": "GEFcom2014/data/wind_data_all_zone.csv",
+    "selection": "ten-zone stratified from context/zone indicators only",
+    "selection_seed": 2026,
+    "test_peeking": false
+  },
+  "hardware": {
+    "logical_n_bits": 48,
+    "hardware_n_bits": 49,
+    "auxiliary_spin_index": 48,
+    "candidate_gains": [125, 150, 200],
+    "reads_per_instance": 100,
+    "sampler_mode": "SAMPLING",
+    "negtail_flip": false,
+    "sort_solutions": false,
+    "hardware_claim": false,
+    "physical_platform_used": false
+  },
+  "vs": {
+    "instances": 10,
+    "instances_per_zone": 1,
+    "tasks": 30,
+    "samples": 3000,
+    "selection_split": "VS"
+  },
+  "test": {
+    "instances": 100,
+    "instances_per_zone": 10,
+    "tasks": 100,
+    "samples": 10000,
+    "selection_split": "TEST",
+    "matrix_status": "logical h,J frozen; hardware gain unresolved until VS calibration"
+  },
+  "budget": {
+    "planned_samples": 13000,
+    "application_upper_limit": 15000,
+    "backup_tasks_max": 20,
+    "backup_samples_max": 2000,
+    "backup_condition": "only documented failed/invalid responses; no gain selection or TEST peeking"
+  },
+  "gain_selection": {
+    "allowed_split": "VS",
+    "metrics": [
+      "energy_wasserstein",
+      "effective_beta_error",
+      "edge_moment_mae",
+      "magnetization_mae",
+      "unique_state_fraction"
+    ],
+    "read_convergence": [50, 100],
+    "freeze_rule": "freeze exactly one gain after VS; rebuild TEST Q from original h,J"
+  },
+  "test_evaluation": {
+    "raw_metrics_first": ["CRPS", "Energy", "Variogram", "Ramp CRPS", "coverage", "MAQCE"],
+    "ecc": "sensitivity_only",
+    "bootstrap": "95% date-block bootstrap over 100 instance dates",
+    "paired_test": "paired sign-flip/permutation",
+    "reads_are_independent_test_units": false,
+    "controls": ["float logical SA", "8-bit quantized-matrix SA", "existing Gibbs/SA"]
+  },
+  "fallback": {
+    "opsd_rolling_origin": "smoke/NOT RUN and excluded from hardware budget",
+    "sdwpf5": "smoke/NOT RUN and excluded from hardware budget",
+    "decision_value": "normalized or NOT RUN unless auditable prices are supplied"
+  }
+}

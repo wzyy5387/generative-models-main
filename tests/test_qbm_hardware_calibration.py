@@ -121,6 +121,19 @@ def test_hardware_payload_cannot_be_rescaled_after_quantization():
     }
     with pytest.raises(ValueError, match="rebuild from the original h,J"):
         scale_payload(payload, 2.0, {"target_beta": 1.0, "beta_eff": 0.5})
+    calibrated = scale_payload(
+        payload,
+        1.0,
+        {
+            "target_beta": 1.0,
+            "beta_eff": 0.5,
+            "logical_beta": 1.0,
+            "matrix_beta": 0.05,
+            "hardware_gain": 20.0,
+        },
+    )
+    assert calibrated["temperature_calibration"]["logical_beta"] == 1.0
+    assert calibrated["temperature_calibration"]["matrix_beta"] == 0.05
 
 
 def test_gain_candidate_selection_is_vs_only_and_deterministic(tmp_path):
@@ -155,6 +168,43 @@ def test_gain_candidate_selection_is_vs_only_and_deterministic(tmp_path):
     assert candidate["hardware_gain"] == 11.0
     assert candidate["n_instances"] == 1
     assert select_gain_candidate([candidate])["hardware_gain"] == 11.0
+
+
+def test_gain_candidate_includes_quantized_reference_metrics(tmp_path):
+    problem_path = tmp_path / "problem.npz"
+    h = np.array([0.3, -0.2])
+    j = np.array([[0.0, 0.1], [0.1, 0.0]])
+    np.savez_compressed(problem_path, h=h, J=j)
+    responses = tmp_path / "responses"
+    references = tmp_path / "references"
+    responses.mkdir()
+    references.mkdir()
+    rng = np.random.default_rng(12)
+    candidate_samples = rng.choice([-1, 1], size=(40, 2)).astype(np.int8)
+    reference_samples = rng.choice([-1, 1], size=(40, 2)).astype(np.int8)
+    np.savez_compressed(responses / "example_000.npz", samples=candidate_samples)
+    np.savez_compressed(references / "example_000.npz", samples=reference_samples)
+    manifest = tmp_path / "vs.json"
+    manifest.write_text(
+        json.dumps([{"id": "example_000", "path": str(problem_path), "split": "VS"}]),
+        encoding="utf-8",
+    )
+
+    result = evaluate_gain_candidate(
+        {
+            "gain": 11.0,
+            "vs_manifest": str(manifest),
+            "responses_dir": str(responses),
+            "reference_dir": str(references),
+        },
+        target_beta=1.0,
+    )
+
+    assert result["reference_dir"] == str(references.resolve())
+    assert result["reference_energy_wasserstein"] >= 0.0
+    assert result["reference_magnetization_mae"] >= 0.0
+    assert result["reference_edge_moment_mae"] >= 0.0
+    assert result["reference_beta_eff_error"] >= 0.0
 
 
 def test_paired_response_metrics_are_zero_for_identical_samples():

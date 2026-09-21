@@ -1,0 +1,86 @@
+{
+  "protocol_version": "sdwpf5-fa-bm-vae-v1",
+  "status": "pre-registered-before-formal-run",
+  "method_name": "FA-BM-VAE",
+  "hardware_claim": false,
+  "physical_platform_used": false,
+  "dataset": {
+    "name": "SDWPF",
+    "subset": "SDWPF-5",
+    "data_access": "external_raw_data_required",
+    "selection_leakage_guard": "power values and TEST labels are excluded from turbine selection",
+    "selected_turbine_ids": null,
+    "selected_turbine_ids_status": "filled from the immutable coordinate file before formal training; unresolved because raw SDWPF coordinates are not present in this repository"
+  },
+  "turbine_selection": {
+    "count": 5,
+    "inputs": ["turbine_id", "x", "y"],
+    "rule": "sort IDs, select lexicographically first turbine, then greedily maximize minimum squared Euclidean distance; ties by turbine ID",
+    "deterministic": true,
+    "uses_target_or_power": false
+  },
+  "time_protocol": {
+    "ordering": "strict chronological order",
+    "context_steps": 168,
+    "forecast_horizon_steps": 24,
+    "split_rule": "first 70% continuous timestamps LS, next 15% VS, final 15% TEST",
+    "window_rule": "discard windows whose context and target cross split boundaries",
+    "shuffle": false,
+    "test_used_for_model_selection": false
+  },
+  "scenario_protocol": {
+    "scenarios_per_case": 100,
+    "primary_raw_metric": "CRPS without ECC",
+    "secondary_raw_metrics": ["Energy score", "Variogram score", "ramp CRPS", "coverage/MAQCE"],
+    "ecc_sensitivity": ["raw", "temporal ECC only"],
+    "report_raw_before_ecc": true
+  },
+  "hardware_offline_preflight": {
+    "enabled": true,
+    "gain_grid": [25.0, 50.0, 75.0, 100.0, 125.0, 150.0, 200.0],
+    "vs_instances": 50,
+    "reads_per_instance": 100,
+    "matrix_beta_rule": "target_beta / hardware_gain",
+    "mock_backend": "offline_quantized_sa_mock",
+    "hardware_claim": false,
+    "physical_platform_used": false
+  },
+  "models": {
+    "primary": "FA-BM-VAE (internal Gibbs negative phase)",
+    "ablation": ["BM-VAE ablation", "FA-BM-VAE with SA negative phase"],
+    "baselines": ["Conditional NF", "Conditional Diffusion/Score-SDE", "D3U", "Treeffuser"],
+    "hardware": "not used in SDWPF-5 formal run unless separately approved"
+  },
+  "randomness": {
+    "training_seeds": [0, 1, 2, 3, 4, 5, 6, 7, 8, 9],
+    "data_selection_seed": null,
+    "seed_aggregation": "compute metrics per seed, then aggregate across seeds"
+  },
+  "statistics": {
+    "primary_comparison": "paired daily block bootstrap over forecast dates",
+    "confidence_level": 0.95,
+    "secondary_test": "two-sided paired sign-flip/permutation test on daily blocks",
+    "alpha": 0.05,
+    "multiple_comparison": "Holm correction across pre-specified secondary metrics",
+    "report_effect_size_and_ci": true
+  },
+  "stopping_rules": {
+    "training_max_epochs": 200,
+    "early_stopping_metric": "VS negative log-likelihood or pre-specified validation loss",
+    "early_stopping_patience": 20,
+    "no_test_peeking": true,
+    "smoke_failure": "stop and fix pipeline before formal seeds",
+    "formal_run_stop": "stop only for reproducible data/schema/resource failure; do not stop based on TEST score"
+  },
+  "resource_monitoring": {
+    "record": ["wall_time_seconds", "peak_python_bytes", "device", "batch_size", "epochs_completed"],
+    "smoke_seed": 0,
+    "formal_run_required": true
+  },
+  "outputs": {
+    "preregistration_file": "configs/paper/sdwpf5_preregistration.json",
+    "smoke_output_dir": "export/sdwpf5",
+    "formal_output_dir": "export/sdwpf5/formal",
+    "metadata_must_include": ["selected_turbines", "time_boundaries", "seeds", "raw_metrics", "ecc_sensitivity", "hardware_claim", "physical_platform_used"]
+  }
+}

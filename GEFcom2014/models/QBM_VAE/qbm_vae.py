@@ -45,6 +45,7 @@ def parse_args():
     )
     parser.add_argument("--tag", default="load")
     parser.add_argument("--dataset-bundle", type=Path, default=None)
+    parser.add_argument("--output-dir", type=Path, default=None)
     parser.add_argument(
         "--sampler",
         default="sa",
@@ -374,7 +375,7 @@ if __name__ == "__main__":
     if not args.skip_plots and set(args.scenario_splits) != {"VS", "TEST"}:
         raise ValueError("Partial scenario generation requires --skip-plots")
 
-    dir_path = "export/qbm_vae_" + tag + "/"
+    dir_path = str(args.output_dir or Path("export") / ("qbm_vae_" + tag)) + "/"
     if not os.path.isdir(dir_path):
         os.makedirs(dir_path)
 

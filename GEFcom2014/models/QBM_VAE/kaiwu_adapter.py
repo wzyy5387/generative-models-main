@@ -225,7 +225,14 @@ class KaiwuClient:
             task_mode=self._task_mode.SAMPLING,
             sample_number=num_reads,
         )
-        samples = np.asarray(optimizer.solve(matrix), dtype=np.int8)
+        samples = np.asarray(
+            optimizer.solve(
+                matrix,
+                negtail_flip=False,
+                sort_solutions=False,
+            ),
+            dtype=np.int8,
+        )
         if samples.ndim != 2 or samples.shape != (num_reads, matrix.shape[0]):
             raise RuntimeError(
                 "Kaiwu returned samples with shape %s; expected (%d, %d)"

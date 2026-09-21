@@ -561,12 +561,24 @@ explicitly with:
 python -m GEFcom2014.models.QBM_VAE.submit_kaiwu_sampling `
   --matrix-file <package>\hardware_matrices\<instance_id>.npz `
   --instance-id <instance_id> --num-reads 100 `
-  --output-dir export\kaiwu_raw_responses
+  --output-dir export\kaiwu_raw_responses `
+  --checkpoint-dir export\kaiwu_checkpoints
 ```
 
 This is the only command in the repository that can submit a Kaiwu task. It
 uses a unique task name and `CIMOptimizer` sampling mode; it requires
-`KAIWU_PROJECT_NO` or an explicit runtime `--project-no`.
+`KAIWU_PROJECT_NO` or an explicit runtime `--project-no`. The checkpoint
+manager is pointed to a task-specific subdirectory below `--checkpoint-dir`;
+the SDK default cache path is never used.
+
+The real integration suite is opt-in and never runs in the normal regression
+suite. Set `FA_BM_VAE_RUN_REAL_KAIWU=1`, `KAIWU_PROJECT_NO`, and the paths
+listed in `tests/test_kaiwu_real_integration.py`, then run:
+
+```powershell
+$env:FA_BM_VAE_RUN_REAL_KAIWU="1"
+D:\anaconda\envs\wsy\python.exe -m pytest -q tests\test_kaiwu_real_integration.py
+```
 
 For every hardware run, generate both controls on the identical frozen
 instances:
@@ -585,6 +597,24 @@ These are respectively floating-point logical SA, the same quantized 8-bit
 matrix sampled by local SA, and the physical Kaiwu/SPQC response. Differences
 between the latter two are the platform sampling effect, while differences
 between the first two are quantization effects.
+
+For the quantized control, `matrix_beta = logical_beta / hardware_gain` and
+both values are stored with `hardware_gain` in the response metadata. Offline
+preflight results use `physical_platform_used=false` and are never physical
+platform evidence.
+
+Run the complete no-platform VS preflight in a new output directory:
+
+```powershell
+D:\anaconda\envs\wsy\python.exe -m GEFcom2014.models.QBM_VAE.hardware_offline_preflight `
+  --tag wind --model-name wind_QBMVAE_2_lanchor_sa_0 `
+  --gain-grid 25 50 75 100 125 150 200 --target-beta 1.0 `
+  --reads 100 --sweeps 20 --selection-seed 2026 `
+  --output-dir export\hardware_offline_preflight --cpu
+```
+
+This command is VS-only and uses local SA to create a deliberately labelled
+mock response. It never imports or calls the Kaiwu SDK.
 
 Kaiwu integration is optional and lazy. The runtime environment must provide
 the SDK license and project number externally, for example through
@@ -716,3 +746,52 @@ Run the focused regression suite with:
 ```powershell
 D:\anaconda\envs\wsy\python.exe -m pytest tests/test_unified_postprocessing.py tests/test_probabilistic_baselines.py tests/test_qbm_path_integral.py tests/test_wind_reliability_inference.py -q
 ```
+## Q1/Q2 completion gates
+
+This repository treats the following as completion gates for an energy
+forecasting submission.  They are protocol requirements, not claims that the
+corresponding experiments have already been completed.
+
+- **OPSD rolling-origin evidence:** `configs/paper/opsd_rolling_origins.json`
+  fixes three expanding LS/VS/TEST origins, four models, 100 scenarios and
+  seeds 0--4.  The runner reports per-origin/per-seed raw CRPS, Energy,
+  Variogram, ramp CRPS, coverage and MAQCE, with date-block bootstrap,
+  paired tests and effect sizes.  The formal 5-seed run is **NOT RUN**.
+  The existing `export/opsd_rolling_origins_real_pilot` artifact used three
+  epochs only for code-connectivity validation; it is excluded from paper
+  tables, statistical claims and conclusions.
+- **Core seed coverage:** the current primary comparison is FA-BM-VAE,
+  Forecast-anchored Gaussian, GMM-4, Score-SDE, D3U and Treeffuser.  Main
+  GEFCom Wind seed 3/4 jobs for the first four models remain **NOT RUN**;
+  exploratory/ablation seeds are not counted as primary replication.
+- **Decision value:** the current implementation is a normalized asymmetric
+  cost-loss sensitivity analysis because no auditable market-price file is
+  present.  It must not be described as a market-profit result until common
+  prices, constraints and dates are supplied for every model.  The smoke test
+  is synthetic and **NOT a paper result**.
+- **Metric protocol:** Raw scenario metrics are primary. Calibrated and
+  model-independent temporal-ECC outputs are pre-registered sensitivities and
+  must fit only on LS/VS; TEST is evaluation-only. A QBM/FA-BM template is an
+  additional sensitivity, never the default ECC template.
+- **FA-BM-VAE scope:** training remains classical; Forecast Anchor models the
+  main trend and the conditional BM/VAE models residual uncertainty.  Kaiwu,
+  CIM or another bosonic platform may replace only the frozen latent sampling
+  step.  Offline SA, mock responses and directories containing `real` are not
+  physical-platform evidence.
+- **Hardware claim gate:** `hardware_claim` and
+  `physical_platform_used` remain false until a response contains a real task
+  ID, SDK version, UTC submission time, platform identifier, matrix hash,
+  reads and response-file hash.  No real task is submitted by the default
+  commands.
+- **Future work:** SDWPF-5 is not part of the empirical evidence of the current
+  study. Existing SDWPF artifacts are synthetic smoke tests used only for
+  pipeline validation and are excluded from all tables, statistical claims,
+  and conclusions. Formal multi-turbine spatiotemporal validation is reserved
+  for future work.
+
+The reported conclusions remain conservative: on GEFCom2014 GMM-4 has mean
+CRPS 0.082830 versus approximately 0.083382/0.083418 for FA-BM-VAE; on OPSD,
+FA-BM-VAE-SA has the lowest point estimate (0.027284) but no stable significant
+advantage over Gaussian or Score-SDE.  Forecast Anchor is the main improvement
+source, while the Temporal-MI graph has no stable advantage over a matched
+random graph.

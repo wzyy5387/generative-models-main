@@ -1,4 +1,6 @@
 import json
+import sys
+from types import SimpleNamespace
 
 import numpy as np
 import pytest
@@ -15,6 +17,8 @@ from GEFcom2014.models.QBM_VAE.kaiwu_adapter import (
 )
 from GEFcom2014.models.QBM_VAE.export_ising_instances import build_platform_payload
 from GEFcom2014.models.QBM_VAE.prepare_bosonic_submission import prepare_submission
+from GEFcom2014.models.QBM_VAE.submit_kaiwu_sampling import submit_one
+from GEFcom2014.models.QBM_VAE import sample_exported_ising
 
 
 def test_auxiliary_matrix_matches_original_energy_by_enumeration():
@@ -69,7 +73,9 @@ def test_kaiwu_client_uses_sampling_mode_without_importing_the_sdk():
         def __init__(self, **kwargs):
             calls.update(kwargs)
 
-        def solve(self, matrix):
+        def solve(self, matrix, negtail_flip=True, sort_solutions=True):
+            calls["negtail_flip"] = negtail_flip
+            calls["sort_solutions"] = sort_solutions
             return np.ones((10, matrix.shape[0]), dtype=np.int8)
 
     client = KaiwuClient.__new__(KaiwuClient)
@@ -87,6 +93,8 @@ def test_kaiwu_client_uses_sampling_mode_without_importing_the_sdk():
     assert calls["task_mode"] == "sampling"
     assert calls["sample_number"] == 10
     assert calls["task_name"] == "unique-test-task"
+    assert calls["negtail_flip"] is False
+    assert calls["sort_solutions"] is False
 
 
 def test_gauge_normalization_and_binary_mapping_are_exact():
@@ -168,3 +176,104 @@ def test_hardware_submission_and_import_keep_49_raw_and_48_logical(tmp_path):
         assert response["samples"].shape == (10, 48)
         np.testing.assert_array_equal(response["samples"][0], -np.ones(48, dtype=np.int8))
     assert audit["records"][0]["logical_n_bits"] == 48
+
+
+def test_submit_one_uses_task_checkpoint_and_records_runtime_audit(tmp_path, monkeypatch):
+    matrix = np.zeros((49, 49), dtype=np.int8)
+    matrix[0, 48] = matrix[48, 0] = -1
+    matrix_path = tmp_path / "matrix.npz"
+    np.savez_compressed(matrix_path, hardware_matrix=matrix, matrix_sha256=matrix_sha256(matrix))
+
+    class FakeCheckpointManager:
+        save_dir = None
+
+    class FakeClient:
+        def __init__(self, **kwargs):
+            self._kaiwu = SimpleNamespace(
+                __version__="test-sdk",
+                common=SimpleNamespace(CheckpointManager=FakeCheckpointManager),
+            )
+
+        def sample_hardware_matrix(self, matrix, num_reads, task_name):
+            return {
+                "samples": np.ones((num_reads, matrix.shape[0]), dtype=np.int8),
+                "metadata": {
+                    "backend": "kaiwu_cim_sampling",
+                    "task_id": "task-123",
+                    "task_name": task_name,
+                },
+            }
+
+    monkeypatch.setattr(
+        "GEFcom2014.models.QBM_VAE.submit_kaiwu_sampling.KaiwuClient",
+        FakeClient,
+    )
+    output_path, audit_path, audit = submit_one(
+        matrix_path,
+        "instance-000",
+        tmp_path / "responses",
+        10,
+        project_no="runtime-only-project",
+        checkpoint_dir=tmp_path / "checkpoints",
+        task_name="unique-task-123",
+    )
+
+    expected_checkpoint = tmp_path / "checkpoints" / "unique-task-123"
+    assert FakeCheckpointManager.save_dir == str(expected_checkpoint.resolve())
+    assert audit["sdk_version"] == "test-sdk"
+    assert audit["platform_backend"] == "kaiwu.cim.CIMOptimizer"
+    assert audit["task_id"] == "task-123"
+    assert audit["matrix_sha256"] == matrix_sha256(matrix)
+    assert audit["checkpoint_dir"] == str(expected_checkpoint.resolve())
+    assert output_path.is_file() and audit_path.is_file()
+
+
+def test_quantized_sa_uses_matrix_beta_and_records_beta_scales(tmp_path, monkeypatch):
+    h = np.array([0.2, -0.1])
+    j = np.array([[0.0, 0.3], [0.3, 0.0]])
+    quantized = quantize_hardware_matrix(h, j, hardware_gain=20.0, logical_n_bits=2)
+    problem_path = tmp_path / "problem.npz"
+    np.savez_compressed(
+        problem_path,
+        h=h,
+        J=j,
+        hardware_matrix=quantized["matrix"],
+        hardware_gain=np.asarray(20.0),
+        hardware_matrix_sha256=np.asarray(quantized["audit"]["matrix_sha256"]),
+    )
+    manifest_path = tmp_path / "manifest.json"
+    manifest_path.write_text(
+        json.dumps([{"id": "example", "path": str(problem_path)}]),
+        encoding="utf-8",
+    )
+    output_dir = tmp_path / "output"
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "sample_exported_ising",
+            "--manifest",
+            str(manifest_path),
+            "--backend",
+            "sa",
+            "--num-reads",
+            "10",
+            "--sweeps",
+            "2",
+            "--beta",
+            "1.0",
+            "--matrix-space",
+            "hardware-quantized",
+            "--output-dir",
+            str(output_dir),
+        ],
+    )
+    sample_exported_ising.main()
+
+    with np.load(output_dir / "sa" / "example.npz", allow_pickle=False) as result:
+        assert float(result["logical_beta"]) == 1.0
+        assert float(result["matrix_beta"]) == 0.05
+        assert float(result["sampler_beta"]) == 0.05
+        assert float(result["hardware_gain"]) == 20.0
+        assert bool(result["hardware_claim"]) is False
+        assert bool(result["physical_platform_used"]) is False

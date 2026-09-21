@@ -79,6 +79,13 @@ def read_json_response(path, n_bits):
             "applied_scale",
             "backend",
             "platform_metadata",
+            "sdk_version",
+            "platform_backend",
+            "submitted_at",
+            "completed_at",
+            "requested_reads",
+            "returned_reads",
+            "checkpoint_dir",
         )
         if key in data
     }
@@ -119,6 +126,13 @@ def read_csv_response(path, n_bits):
             "bit_order",
             "job_id",
             "backend",
+            "sdk_version",
+            "platform_backend",
+            "submitted_at",
+            "completed_at",
+            "requested_reads",
+            "returned_reads",
+            "checkpoint_dir",
         )
         if key in fields and rows[0][key] != ""
     }
@@ -145,6 +159,13 @@ def read_npz_response(path, n_bits):
             "latency_s",
             "applied_scale",
             "backend",
+            "sdk_version",
+            "platform_backend",
+            "submitted_at",
+            "completed_at",
+            "requested_reads",
+            "returned_reads",
+            "checkpoint_dir",
         ):
             if key in response:
                 value = np.asarray(response[key]).reshape(-1)
@@ -278,7 +299,25 @@ def import_responses(
                 )
             ),
             "raw_response_sha256": sha256_file(response_path),
+            "sdk_version": str(metadata.get("sdk_version", "")),
+            "platform_backend": str(metadata.get("platform_backend", "")),
+            "submitted_at": str(metadata.get("submitted_at", "")),
+            "completed_at": str(metadata.get("completed_at", "")),
+            "requested_reads": int(metadata.get(
+                "requested_reads", submission["requested_reads_per_instance"]
+            )),
+            "returned_reads": int(samples.shape[0]),
+            "checkpoint_dir": str(metadata.get("checkpoint_dir", "")),
         }
+        platform_complete = bool(
+            is_hardware_response and task_id and metadata.get("task_name") and
+            metadata.get("sdk_version") and metadata.get("platform_backend") and
+            metadata.get("submitted_at") and metadata.get("completed_at") and
+            response_matrix_hash and sha256_file(response_path) and
+            samples.shape[0] == submission["requested_reads_per_instance"]
+        )
+        response_arrays["hardware_claim"] = bool(platform_complete)
+        response_arrays["physical_platform_used"] = bool(platform_complete)
         if is_hardware_response:
             response_arrays.update(
                 {
@@ -311,6 +350,15 @@ def import_responses(
                     )
                 ),
                 "hardware_matrix_sha256": matrix_hash,
+                "task_name": str(metadata.get("task_name", "")),
+                "sdk_version": str(metadata.get("sdk_version", "")),
+                "platform_backend": str(metadata.get("platform_backend", "")),
+                "submitted_at": str(metadata.get("submitted_at", "")),
+                "completed_at": str(metadata.get("completed_at", "")),
+                "response_file_sha256": sha256_file(response_path),
+                "checkpoint_dir": str(metadata.get("checkpoint_dir", "")),
+                "hardware_claim": bool(platform_complete),
+                "physical_platform_used": bool(platform_complete),
             }
         )
     audit = {
@@ -326,7 +374,12 @@ def import_responses(
             "hardware_substitution",
             "platform replaces only frozen conditional Ising latent sampling",
         ),
-        "hardware_claim": bool(submission.get("hardware_claim", False)),
+        "hardware_claim": bool(records) and all(
+            record.get("hardware_claim", False) for record in records
+        ),
+        "physical_platform_used": bool(records) and all(
+            record.get("physical_platform_used", False) for record in records
+        ),
         "submission_stage": submission["stage"],
         "submission_manifest": str(Path(submission_manifest).resolve()),
         "n_expected": len(submission["instances"]),

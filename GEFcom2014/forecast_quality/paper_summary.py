@@ -4,6 +4,9 @@ import csv
 import json
 from pathlib import Path
 
+from GEFcom2014.forecast_quality.paper_artifact_guard import parse_bool
+from GEFcom2014.forecast_quality.paper_artifact_guard import assert_paper_eligible
+
 
 ROOT_DIR = Path(__file__).resolve().parents[2]
 METRICS_PATH = ROOT_DIR / "export" / "scenario_comparison" / "metrics.csv"
@@ -41,6 +44,9 @@ def read_metrics():
     with METRICS_PATH.open("r", newline="", encoding="utf-8") as handle:
         rows = list(csv.DictReader(handle))
     for row in rows:
+        metadata = {key: row[key] for key in ("smoke_only", "synthetic_data", "eligible_for_paper")
+                    if key in row and row[key] != ""}
+        assert_paper_eligible(metadata, source="scenario_comparison.csv")
         row["mean_qs"] = float(row["mean_qs"])
         row["mean_crps_percent"] = float(row["mean_crps_percent"])
         row["reliability_mae"] = float(row["reliability_mae"])

@@ -236,6 +236,77 @@ def reshape_scenarios_by_day(scenarios, n_days, max_s=100):
     return samples.reshape(n_days, 24, samples.shape[1])
 
 
+def _ensemble_crps(samples, target):
+    """CRPS for one vector-valued trajectory represented by ensemble samples."""
+    samples = np.asarray(samples, dtype=np.float64)
+    target = np.asarray(target, dtype=np.float64)
+    if samples.ndim != 2 or target.shape != (samples.shape[1],):
+        raise ValueError("samples/target must have shapes (n_scenarios, n_features)/(n_features,)")
+    return float(np.mean(np.abs(samples - target[None, :])) -
+                 0.5 * np.mean(np.abs(samples[:, None, :] - samples[None, :, :])))
+
+
+def ramp_crps_by_day(scenarios, y_matrix, max_s=100):
+    """Compute ramp CRPS per date from the scenario ramp trajectories."""
+    samples = reshape_scenarios_by_day(scenarios, y_matrix.shape[0], max_s)
+    observations = np.asarray(y_matrix, dtype=np.float64)
+    return np.asarray([
+        _ensemble_crps(np.diff(samples[day], axis=0).T, np.diff(observations[day]))
+        for day in range(observations.shape[0])
+    ], dtype=np.float64)
+
+
+def coverage_interval_by_day(scenarios, y_matrix, lower=0.05, upper=0.95, max_s=100):
+    """Return 90% PICP and mean interval width for every date."""
+    samples = reshape_scenarios_by_day(scenarios, y_matrix.shape[0], max_s)
+    observations = np.asarray(y_matrix, dtype=np.float64)
+    low = np.quantile(samples, lower, axis=2)
+    high = np.quantile(samples, upper, axis=2)
+    return (np.mean((observations >= low) & (observations <= high), axis=1),
+            np.mean(high - low, axis=1))
+
+
+def maqce_by_day(scenarios, y_matrix, max_s=100):
+    """Mean absolute quantile coverage error per date on a fixed grid."""
+    samples = reshape_scenarios_by_day(scenarios, y_matrix.shape[0], max_s)
+    observations = np.asarray(y_matrix, dtype=np.float64)
+    levels = np.linspace(0.05, 0.95, 19)
+    observed = np.asarray([
+        [np.mean(observations[day] <= np.quantile(samples[day], level, axis=1))
+         for level in levels]
+        for day in range(observations.shape[0])
+    ])
+    return np.mean(np.abs(observed - levels[None, :]), axis=1)
+
+
+def evaluate_model_daily(scenarios, y_matrix, max_s=100):
+    """Return the raw, per-date metrics used by the rolling-origin protocol."""
+    scenarios = np.asarray(scenarios, dtype=np.float64)
+    y_matrix = np.asarray(y_matrix, dtype=np.float64)
+    if y_matrix.ndim != 2 or scenarios.shape[0] != y_matrix.shape[0] * 24:
+        raise ValueError("Scenario periods must equal 24 times the number of dates")
+    samples = reshape_scenarios_by_day(scenarios, y_matrix.shape[0], max_s)
+    target = y_matrix.reshape(-1)
+    flat = scenarios[:, :max_s]
+    ordered = np.sort(flat, axis=1)
+    n_scenarios = flat.shape[1]
+    coefficients = 2 * np.arange(1, n_scenarios + 1) - n_scenarios - 1
+    crps_period = (np.mean(np.abs(flat - target[:, None]), axis=1) -
+                   np.sum(ordered * coefficients[None, :], axis=1) / n_scenarios ** 2)
+    crps = crps_period.reshape(y_matrix.shape[0], 24).mean(axis=1)
+    picp, width = coverage_interval_by_day(scenarios, y_matrix, max_s=max_s)
+    return {
+        "CRPS_raw": crps,
+        "Energy": energy_score_by_day(scenarios, y_matrix, max_s=max_s),
+        "Variogram": variogram_score_by_day(scenarios, y_matrix, max_s=max_s),
+        "ramp_CRPS": ramp_crps_by_day(scenarios, y_matrix, max_s=max_s),
+        "PICP90": picp,
+        "coverage": picp,
+        "interval_width90": width,
+        "MAQCE": maqce_by_day(scenarios, y_matrix, max_s=max_s),
+    }
+
+
 def export_metrics(rows):
     path = OUTPUT_DIR / "metrics.csv"
     fieldnames = [

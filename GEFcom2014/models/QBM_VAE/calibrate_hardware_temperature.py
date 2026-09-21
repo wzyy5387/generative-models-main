@@ -59,6 +59,8 @@ def scale_payload(payload, coefficient_scale, calibration):
     scaled["temperature_calibration"] = {
         "fit_split": "VS",
         "target_beta": calibration["target_beta"],
+        "logical_beta": calibration.get("logical_beta", calibration["target_beta"]),
+        "matrix_beta": calibration.get("matrix_beta", calibration["target_beta"]),
         "estimated_beta_eff": calibration["beta_eff"],
         "coefficient_scale": coefficient_scale,
         "platform_has_no_direct_beta": bool(
@@ -109,8 +111,10 @@ def evaluate_gain_candidate(candidate, target_beta=1.0, bootstrap_repetitions=0,
         bootstrap_repetitions=bootstrap_repetitions,
         seed=seed,
     )
-    return {
+    result = {
         "hardware_gain": float(candidate["gain"]),
+        "logical_beta": float(target_beta),
+        "matrix_beta": float(target_beta / float(candidate["gain"])),
         "vs_manifest": str(manifest_path.resolve()),
         "responses_dir": str(responses_dir.resolve()),
         "beta_eff": beta["beta_eff"],
@@ -147,6 +151,7 @@ def evaluate_gain_candidate(candidate, target_beta=1.0, bootstrap_repetitions=0,
         result["reference_beta_eff_error"] = float(
             np.mean([abs(item["candidate_beta_eff"] - item["reference_beta_eff"]) for item in reference_metrics])
         )
+    return result
 
 
 def select_gain_candidate(candidates, target_beta=1.0):
@@ -304,8 +309,11 @@ def main():
         if len(gains) != 1:
             raise ValueError("VS hardware manifest must use one global hardware_gain")
         coefficient_scale = 1.0
+        hardware_gain = gains.pop()
         calibration["platform_has_no_direct_beta"] = True
-        calibration["hardware_gain"] = gains.pop()
+        calibration["hardware_gain"] = hardware_gain
+        calibration["logical_beta"] = float(args.target_beta)
+        calibration["matrix_beta"] = float(args.target_beta / hardware_gain)
         calibration["gain_selection_frozen"] = True
     else:
         coefficient_scale = float(args.target_beta / calibration["beta_eff"])

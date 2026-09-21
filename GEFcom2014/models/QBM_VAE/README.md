@@ -291,8 +291,15 @@ The opt-in single-instance submission command is:
 python -m GEFcom2014.models.QBM_VAE.submit_kaiwu_sampling `
   --matrix-file <package>\hardware_matrices\<instance_id>.npz `
   --instance-id <instance_id> --num-reads 100 `
-  --output-dir export\kaiwu_raw_responses
+  --output-dir export\kaiwu_raw_responses `
+  --checkpoint-dir export\kaiwu_checkpoints
 ```
+
+`--checkpoint-dir` is required. A task-specific subdirectory is created below
+it and assigned to Kaiwu's `CheckpointManager.save_dir`, so the SDK default
+cache path is not used. The real integration tests are opt-in only:
+`FA_BM_VAE_RUN_REAL_KAIWU=1` plus the platform variables documented in
+`tests/test_kaiwu_real_integration.py`.
 
 It is the only repository entry point that can contact Kaiwu. Tests never call
 it, and the repository contains no license, account, key, or project number.
