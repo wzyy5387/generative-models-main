@@ -770,7 +770,8 @@ def validate_formal_matrix(rows, statuses, protocol):
 
 
 def aggregate_metric_rows(rows, reference_model="FA-BM-VAE", bootstrap_repetitions=2000,
-                          permutation_repetitions=2000, seed=2026):
+                          permutation_repetitions=2000, seed=2026,
+                          allow_formal_task_rows=False):
     """Aggregate per-date rows and compare every model with FA-BM-VAE.
 
     Input rows must contain origin_id, date, model, seed and the six metric
@@ -782,7 +783,7 @@ def aggregate_metric_rows(rows, reference_model="FA-BM-VAE", bootstrap_repetitio
     for row in rows:
         if parse_bool(row.get("smoke_only"), "smoke_only") is True or parse_bool(
             row.get("synthetic_data"), "synthetic_data"
-        ) is True or ("eligible_for_paper" in row and parse_bool(
+        ) is True or (not allow_formal_task_rows and "eligible_for_paper" in row and parse_bool(
             row.get("eligible_for_paper"), "eligible_for_paper") is False):
             raise ValueError("Formal OPSD aggregation refuses smoke/synthetic rows")
         missing = {"origin_id", "date", "model", "seed"}.union(METRICS) - set(row)
@@ -865,6 +866,128 @@ def aggregate_metric_rows(rows, reference_model="FA-BM-VAE", bootstrap_repetitio
             "paired_comparisons": comparisons}
 
 
+def _read_csv_rows(path):
+    with Path(path).open(newline="", encoding="utf-8") as handle:
+        return list(csv.DictReader(handle))
+
+
+def validate_formal_parent(formal_status_path, metrics_csv_path, protocol):
+    """Load a frozen formal parent and fail closed before any aggregation."""
+    formal_status_path = Path(formal_status_path)
+    metrics_csv_path = Path(metrics_csv_path)
+    parent = json.loads(formal_status_path.read_text(encoding="utf-8"))
+    required = {
+        "artifact_role": "formal_complete",
+        "eligible_for_paper": True,
+        "formal_matrix_complete": True,
+        "formal_run_status": "COMPLETED",
+        "n_completed": 60,
+        "n_failed": 0,
+        "smoke_only": False,
+        "synthetic_data": False,
+    }
+    for key, expected in required.items():
+        if parent.get(key) != expected:
+            raise ValueError("formal parent %s must be %r" % (key, expected))
+    actual_hash = file_sha256(metrics_csv_path)
+    if parent.get("metrics_sha256") != actual_hash:
+        raise ValueError("formal parent metrics CSV SHA-256 mismatch")
+    rows = _read_csv_rows(metrics_csv_path)
+    statuses = parent.get("status", [])
+    validate_formal_matrix(rows, statuses, protocol)
+    return parent, rows
+
+
+def analyze_formal_parent(formal_status_path, metrics_csv_path, output_dir,
+                          protocol, command=None, bootstrap_repetitions=2000,
+                          permutation_repetitions=2000, seed=2026):
+    parent, rows = validate_formal_parent(formal_status_path, metrics_csv_path, protocol)
+    result = aggregate_metric_rows(
+        rows,
+        bootstrap_repetitions=bootstrap_repetitions,
+        permutation_repetitions=permutation_repetitions,
+        seed=seed,
+        allow_formal_task_rows=True,
+    )
+    output_dir = Path(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    write_csv(output_dir / "raw_per_origin_model_metrics.csv", [
+        {"origin_id": origin, "model": model, "metric": metric,
+         "mean": float(np.mean([float(row[metric]) for row in rows
+                                 if row["origin_id"] == origin and row["model"] == model]))}
+        for origin in REGISTERED_ORIGINS for model in REGISTERED_MODELS for metric in METRICS
+    ])
+    write_csv(output_dir / "raw_overall_model_metrics.csv", result["model_metrics"])
+    write_csv(output_dir / "raw_per_date_seed_means.csv", result["per_date_seed_means"])
+    comparisons = []
+    for row in result["paired_comparisons"]:
+        primary = {key: value for key, value in row.items() if key != "block_bootstrap_14"}
+        primary["block_length_days"] = 7
+        comparisons.append(primary)
+        sensitivity = dict(row["block_bootstrap_14"])
+        sensitivity.update({"model": row["model"], "reference_model": row["reference_model"],
+                            "metric": row["metric"], "holm_p": row["holm_p"],
+                            "block_length_days": 14})
+        comparisons.append(sensitivity)
+    for block_length in (7, 14):
+        for metric in METRICS:
+            family = [row for row in comparisons
+                      if row["block_length_days"] == block_length and row["metric"] == metric]
+            previous = 0.0
+            for rank, row in enumerate(sorted(family, key=lambda item: item["paired_sign_flip_p"])):
+                row["holm_p"] = max(previous, min(1.0, row["paired_sign_flip_p"] * (len(family) - rank)))
+                previous = row["holm_p"]
+    write_csv(output_dir / "raw_paired_comparisons_7day.csv",
+              [row for row in comparisons if row["block_length_days"] == 7])
+    write_csv(output_dir / "raw_paired_comparisons_14day.csv",
+              [row for row in comparisons if row["block_length_days"] == 14])
+    manifest = {
+        "artifact_role": "formal_analysis",
+        "parent_formal_status": str(Path(formal_status_path).resolve()),
+        "parent_metrics_csv": str(Path(metrics_csv_path).resolve()),
+        "parent_formal_status_sha256": file_sha256(formal_status_path),
+        "parent_metrics_sha256": file_sha256(metrics_csv_path),
+        "git_commit": git_commit(), "git_dirty": git_dirty(),
+        "paper_qualification": {key: parent.get(key) for key in (
+            "artifact_role", "eligible_for_paper", "formal_matrix_complete",
+            "formal_run_status", "n_completed", "n_failed", "smoke_only", "synthetic_data"
+        )},
+        "code_hashes": parent.get("provenance", {}).get("source_hashes", {}),
+        "dataset_sha256": parent.get("provenance", {}).get("dataset_sha256"),
+        "statistics": {"bootstrap_repetitions": bootstrap_repetitions,
+                        "permutation_repetitions": permutation_repetitions,
+                        "primary_block_length_days": 7,
+                        "sensitivity_block_length_days": 14,
+                        "paired_difference": "baseline - FA-BM-VAE",
+                        "seed": seed, "holm_correction": "within metric family"},
+        "command": command or [],
+        "outputs": {},
+    }
+    summary = {"artifact_role": "formal_analysis", "paper_qualification": manifest["paper_qualification"],
+               "parent": manifest, "summary": {
+                   "n_metric_rows": len(rows),
+                   "n_origin_model_seed_groups": len({(row["origin_id"], row["model"], row["seed"]) for row in rows}),
+                   "origins": sorted({row["origin_id"] for row in rows}),
+                   "models": sorted({row["model"] for row in rows}),
+                   "seeds": sorted({int(row["seed"]) for row in rows}),
+               },
+               "model_metrics": result["model_metrics"],
+               "paired_comparisons": result["paired_comparisons"]}
+    atomic_write_json(output_dir / "raw_analysis_summary.json", summary)
+    report = ["# OPSD Raw Statistical Report", "", "This report is descriptive and does not claim statistical superiority.", "",
+              "- Primary inference: 7-day continuous-time block bootstrap.",
+              "- Sensitivity inference: 14-day block bootstrap.",
+              "- Paired difference direction: baseline - FA-BM-VAE.",
+              "- Multiplicity correction: Holm within each metric family.", ""]
+    report.extend(["## Outputs", "", "See `raw_overall_model_metrics.csv` and paired comparison CSVs.", ""])
+    (output_dir / "RAW_STATISTICAL_REPORT.md").write_text("\n".join(report), encoding="utf-8")
+    for path in sorted(output_dir.iterdir()):
+        if path.is_file() and path.name != "analysis_manifest.json":
+            manifest["outputs"][path.name] = file_sha256(path)
+    atomic_write_json(output_dir / "analysis_manifest.json", manifest)
+    return summary
+
+
 def write_csv(path, rows):
     if not rows:
         return
@@ -906,6 +1029,8 @@ def main():
     parser.add_argument("--dataset-bundle", type=Path, default=None)
     parser.add_argument("--output-dir", type=Path, default=DEFAULT_OUTPUT)
     parser.add_argument("--metrics-csv", type=Path, default=None)
+    parser.add_argument("--analyze-formal", action="store_true")
+    parser.add_argument("--formal-status", type=Path, default=None)
     parser.add_argument("--smoke", action="store_true")
     parser.add_argument("--execute", action="store_true")
     parser.add_argument("--raw-source", type=Path,
@@ -938,6 +1063,18 @@ def main():
     if args.workers > 1 and args.device in ("auto", "cuda"):
         raise SystemExit("GPU execution is limited to workers=1 on this single-GPU protocol")
     output_dir = Path(args.output_dir)
+    if args.analyze_formal:
+        if args.formal_status is None or args.metrics_csv is None:
+            raise SystemExit("--analyze-formal requires --formal-status and --metrics-csv")
+        analyze_formal_parent(
+            args.formal_status,
+            args.metrics_csv,
+            output_dir,
+            protocol,
+            command=[sys.executable, "-m", "GEFcom2014.forecast_quality.opsd_rolling_origins"] + sys.argv[1:],
+        )
+        print("Wrote OPSD formal analysis outputs to %s" % output_dir.resolve())
+        return
     output_dir.mkdir(parents=True, exist_ok=True)
     manifest = build_run_manifest(protocol, args.dataset_bundle,
                                   artifact_role="acceptance" if args.acceptance else "formal_task")

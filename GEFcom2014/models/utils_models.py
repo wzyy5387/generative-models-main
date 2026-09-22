@@ -5,7 +5,7 @@ import matplotlib.pyplot as plt
 
 from sklearn.preprocessing import StandardScaler
 
-def scale_data_multi(x_LS: np.array, y_LS: np.array, x_VS: np.array, y_VS: np.array, x_TEST: np.array, y_TEST: np.array):
+def scale_data_multi(x_LS: np.array, y_LS: np.array, x_VS: np.array, y_VS: np.array, x_TEST: np.array = None, y_TEST: np.array = None):
     """
     Scale data for NFs multi-output.
     """
@@ -13,13 +13,13 @@ def scale_data_multi(x_LS: np.array, y_LS: np.array, x_VS: np.array, y_VS: np.ar
     y_LS_scaler.fit(y_LS)
     y_LS_scaled = y_LS_scaler.transform(y_LS)
     y_VS_scaled = y_LS_scaler.transform(y_VS)
-    y_TEST_scaled = y_LS_scaler.transform(y_TEST)
+    y_TEST_scaled = y_LS_scaler.transform(y_TEST) if y_TEST is not None else None
 
     x_LS_scaler = StandardScaler()
     x_LS_scaler.fit(x_LS)
     x_LS_scaled = x_LS_scaler.transform(x_LS)
     x_VS_scaled = x_LS_scaler.transform(x_VS)
-    x_TEST_scaled = x_LS_scaler.transform(x_TEST)
+    x_TEST_scaled = x_LS_scaler.transform(x_TEST) if x_TEST is not None else None
 
     return x_LS_scaled, y_LS_scaled,  x_VS_scaled, y_VS_scaled, x_TEST_scaled, y_TEST_scaled, y_LS_scaler
 

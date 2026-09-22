@@ -11,6 +11,7 @@ from GEFcom2014.forecast_quality.opsd_rolling_origins import (
     load_protocol,
     origin_windows,
     smoke_rows,
+    validate_formal_parent,
     validate_formal_matrix,
 )
 from GEFcom2014.forecast_quality.compare_scenarios import evaluate_model_daily
@@ -51,6 +52,38 @@ def test_time_blocks_are_built_inside_each_origin_only():
 def test_formal_matrix_completeness_fails_closed():
     with pytest.raises(ValueError, match="60 registered"):
         validate_formal_matrix([], [], load_protocol())
+
+
+def test_formal_task_rows_require_a_validated_formal_parent():
+    row = dict(smoke_rows(load_protocol())[0])
+    row.update({"artifact_role": "formal_task", "eligible_for_paper": "false"})
+    with pytest.raises(ValueError, match="Formal OPSD aggregation"):
+        aggregate_metric_rows([row], bootstrap_repetitions=10, permutation_repetitions=10)
+    result = aggregate_metric_rows(
+        [row], bootstrap_repetitions=10, permutation_repetitions=10,
+        allow_formal_task_rows=True,
+    )
+    assert result["per_date_seed_means"][0]["n_seeds"] == 1
+
+
+def test_formal_parent_rejects_incomplete_or_tampered_inputs(tmp_path):
+    status_path = tmp_path / "formal_status.json"
+    metrics_path = tmp_path / "metrics_per_date.csv"
+    metrics_path.write_text("origin_id,date,model,seed\n", encoding="utf-8")
+    status_path.write_text(json.dumps({
+        "artifact_role": "formal_complete",
+        "eligible_for_paper": True,
+        "formal_matrix_complete": True,
+        "formal_run_status": "COMPLETED",
+        "n_completed": 60,
+        "n_failed": 0,
+        "smoke_only": False,
+        "synthetic_data": False,
+        "metrics_sha256": "wrong",
+        "status": [],
+    }), encoding="utf-8")
+    with pytest.raises(ValueError, match="SHA-256 mismatch"):
+        validate_formal_parent(status_path, metrics_path, load_protocol())
 
 
 def test_resume_requires_all_source_and_output_hashes(tmp_path):
