@@ -756,10 +756,12 @@ corresponding experiments have already been completed.
   fixes three expanding LS/VS/TEST origins, four models, 100 scenarios and
   seeds 0--4.  The runner reports per-origin/per-seed raw CRPS, Energy,
   Variogram, ramp CRPS, coverage and MAQCE, with date-block bootstrap,
-  paired tests and effect sizes.  The formal 5-seed run is **NOT RUN**.
-  The existing `export/opsd_rolling_origins_real_pilot` artifact used three
-  epochs only for code-connectivity validation; it is excluded from paper
-  tables, statistical claims and conclusions.
+  paired tests and effect sizes.  The frozen formal result is complete at
+  `export/opsd_rolling_origins_formal_v1`: 60/60 tasks, 5 seeds, 5,400 raw
+  date rows, `artifact_role=formal_complete`, and `eligible_for_paper=true`.
+  The independent statistical outputs are written to
+  `export/opsd_rolling_origins_formal_v1_analysis`; Raw remains the primary
+  result and Cal/Temporal-ECC are sensitivities only.
 - **Core seed coverage:** the current primary comparison is FA-BM-VAE,
   Forecast-anchored Gaussian, GMM-4, Score-SDE, D3U and Treeffuser.  Main
   GEFCom Wind seed 3/4 jobs for the first four models remain **NOT RUN**;
@@ -784,10 +786,10 @@ corresponding experiments have already been completed.
   reads and response-file hash.  No real task is submitted by the default
   commands.
 - **Future work:** SDWPF-5 is not part of the empirical evidence of the current
-  study. Existing SDWPF artifacts are synthetic smoke tests used only for
-  pipeline validation and are excluded from all tables, statistical claims,
-  and conclusions. Formal multi-turbine spatiotemporal validation is reserved
-  for future work.
+  study and is intentionally not run in this round. Existing SDWPF artifacts
+  are synthetic smoke tests used only for pipeline validation and are excluded
+  from all tables, statistical claims, and conclusions. Formal multi-turbine
+  spatiotemporal validation is reserved for future work.
 
 The reported conclusions remain conservative: on GEFCom2014 GMM-4 has mean
 CRPS 0.082830 versus approximately 0.083382/0.083418 for FA-BM-VAE; on OPSD,

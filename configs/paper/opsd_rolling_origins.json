@@ -91,6 +91,16 @@
     "permutation_repetitions": 2000,
     "seed": 2026
   },
-  "formal_run_status": "NOT RUN",
+  "formal_run_status": "COMPLETED",
+  "formal_output_dir": "export/opsd_rolling_origins_formal_v1",
+  "formal_analysis_output_dir": "export/opsd_rolling_origins_formal_v1_analysis",
+  "formal_matrix": {
+    "n_tasks": 60,
+    "n_completed": 60,
+    "n_failed": 0,
+    "artifact_role": "formal_complete",
+    "eligible_for_paper": true,
+    "raw_metrics_rows": 5400
+  },
   "test_peeking": false
 }

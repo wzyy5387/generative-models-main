@@ -72,7 +72,7 @@
     "controls": ["float logical SA", "8-bit quantized-matrix SA", "existing Gibbs/SA"]
   },
   "fallback": {
-    "opsd_rolling_origin": "smoke/NOT RUN and excluded from hardware budget",
+    "opsd_rolling_origin": "formal 3-origin x 4-model x 5-seed Raw matrix complete; hardware remains separately gated",
     "sdwpf5": "smoke/NOT RUN and excluded from hardware budget",
     "decision_value": "normalized or NOT RUN unless auditable prices are supplied"
   }
