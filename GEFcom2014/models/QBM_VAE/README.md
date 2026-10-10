@@ -116,7 +116,12 @@ must not be claimed as direct preparation of a non-commuting quantum Gibbs
 state unless the hardware and measurement protocol actually implement that
 state.
 
-## Frozen SA/CIM comparison and temperature calibration
+## Historical offline SA/CIM comparison and temperature calibration
+
+The following section documents the historical 50-VS / 500-TEST experiment
+with 1000 reads per instance. It is retained for provenance and is not the
+current Kaiwu submission protocol. Its SA replay and response archive are
+offline evidence only; no physical-platform result is claimed.
 
 For the classical FA-BM-VAE mainline, export disjoint VS and TEST instances
 with exactly the same learned-anchor transformation used in training:
@@ -232,6 +237,51 @@ advantage. A hardware claim requires responses returned by the physical
 platform for the same frozen payloads, alongside SA controls, read count,
 latency, failures, coefficient clipping, embedding, and platform metadata.
 
+## Current FA-BM-VAE Kaiwu 13k protocol
+
+The authoritative current plan is
+`configs/paper/fa_bm_vae_kaiwu_13k_protocol.json`. Training is classical:
+the frozen FA-BM-VAE replaces only the conditional Ising latent sampler on the
+platform. There are currently no physical-platform results. The current
+hardware profile is CPQC-550 (550-variable capacity, full connectivity, int8
+contract); this is a package constraint record, not evidence that a task has
+run.
+
+The current budget is fixed as follows:
+
+```text
+VS:    10 fixed stratified conditions x 3 gains (125, 150, 200) x 100 reads
+       = 30 tasks and 3,000 reads
+TEST:  100 fixed conditions x 100 reads, only after VS freezes one gain
+       = 100 tasks and 10,000 reads
+planned total: 13,000 reads; backup maximum: 2,000; application limit: 15,000
+```
+
+The three gains share the same VS condition IDs. TEST matrices must be rebuilt
+from the original floating-point `h,J` after VS-only calibration freezes one
+gain. No TEST result may select or alter that gain. The old 50-VS / 500-TEST /
+1000-read archive remains historical and must not be interpreted as this
+13,000-read submission plan.
+
+The code and documentation are ready for a manually gated single-task canary,
+but submission is blocked until Sampling Credits, `KAIWU_PROJECT_NO`, and a
+licensed SDK/account environment are supplied. The first canary is intentionally
+not run here:
+
+```powershell
+$env:FA_BM_VAE_RUN_REAL_KAIWU="1"
+$env:KAIWU_PROJECT_NO="<manually-provided-project-no>"
+D:\anaconda\envs\wsy\python.exe -m GEFcom2014.models.QBM_VAE.run_kaiwu_13k_sampling `
+  --stage vs --execute --limit 1 --resume --confirm-real-submission `
+  --output-dir export\kaiwu_13k_preparation\real_responses `
+  --checkpoint-dir export\kaiwu_13k_preparation\real_checkpoints
+```
+
+This command must be run only after the external conditions are confirmed.
+The remaining VS tasks use the same driver with `--resume`; TEST is blocked
+until the three VS gains are complete and the immutable VS-only gain selection
+record exists.
+
 ### FA-BM-VAE platform-to-scenario reconstruction
 
 The paper method is **FA-BM-VAE**: Forecast Anchor supplies the main trend;
@@ -323,11 +373,11 @@ beta error on the original floating-point `h,J`, then prefers state diversity
 and lower absolute magnetization. A selected gain is frozen; any new gain
 requires rebuilding and re-quantizing from the original `h,J`.
 
-Run the physical experiment in three stages: (1) 5--10 stratified VS
-instances with 100 reads to validate the interface, (2) 50 stratified VS
-instances with 1000 reads for gain selection and temperature diagnostics, and
-(3) only after freezing the gain, 500 TEST instances with 100 reads. Every
-stage compares floating-point SA, quantized-matrix SA, and Kaiwu/SPQC samples.
+The historical staged proposal of (1) 5--10 VS instances with 100 reads, (2)
+50 VS instances with 1000 reads, and (3) 500 TEST instances is superseded by
+the current 13k protocol above. Every future physical comparison must still
+include floating-point SA and quantized-matrix SA controls on the same frozen
+instances, but those controls do not turn offline SA into a physical result.
 
 ## Temporal marginal-dependence decomposition
 

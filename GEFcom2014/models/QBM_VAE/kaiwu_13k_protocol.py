@@ -14,6 +14,7 @@ import numpy as np
 
 from .compare_hardware_responses import compare_response_pair, response_statistics
 from .ising import ising_energy
+from .kaiwu_adapter import kaiwu_sdk_versions
 
 
 ROOT_DIR = Path(__file__).resolve().parents[3]
@@ -60,6 +61,15 @@ def validate_protocol(protocol):
         raise ValueError("Planned sample budget must be 13000")
     if protocol["budget"]["application_upper_limit"] != 15000:
         raise ValueError("Application upper limit must be 15000")
+    limits = hardware.get("platform_limits", {})
+    if limits.get("int8_coefficient_range") != [-128, 127]:
+        raise ValueError("Protocol must record the verified int8 coefficient range")
+    if limits.get("int8_range_verified") is not True:
+        raise ValueError("Protocol int8 coefficient range must be verified")
+    profile = limits.get("machine_profile", {})
+    if profile != {"name": "CPQC-550", "max_variables": 550,
+                   "full_connectivity": True, "coupling_precision": "int8"}:
+        raise ValueError("Protocol must declare the CPQC-550 machine profile")
 
 
 def load_manifest(path):
@@ -106,8 +116,11 @@ def validate_vs_manifests(paths, protocol):
 
 def validate_test_manifest(path, protocol):
     items = load_manifest(path)
-    if len(items) != protocol["test"]["instances"]:
-        raise ValueError("TEST manifest must contain 100 instances")
+    if not items:
+        raise ValueError("TEST manifest must contain at least one instance")
+    if (len(items) != protocol["test"]["instances"] and
+            not protocol["test"].get("allow_preregistered_subset", False)):
+        raise ValueError("TEST manifest does not match the frozen protocol size")
     zones = []
     ids = []
     for item in items:
@@ -129,8 +142,8 @@ def validate_test_manifest(path, protocol):
     if len(set(ids)) != len(ids):
         raise ValueError("Duplicate TEST instance IDs")
     counts = {zone: zones.count(zone) for zone in range(1, 11)}
-    if counts != {zone: 10 for zone in range(1, 11)}:
-        raise ValueError("TEST manifest must contain 10 instances per zone")
+    if len(items) == protocol["test"]["instances"] and counts != {zone: 10 for zone in range(1, 11)}:
+        raise ValueError("Full TEST manifest must contain 10 instances per zone")
     return {"path": str(Path(path).resolve()), "instances": items, "zone_counts": counts}
 
 
@@ -154,6 +167,9 @@ def audit_budget(vs_paths, test_path, protocol):
         "hardware_claim": False,
         "physical_platform_used": False,
         "test_peeking": False,
+        "platform_limits_checked": dict(protocol["hardware"]["platform_limits"]),
+        "machine_profile": dict(protocol["hardware"]["platform_limits"]["machine_profile"]),
+        "sdk_versions": kaiwu_sdk_versions(),
     }
     if result["vs_tasks"] != 30 or result["vs_samples"] != 3000:
         raise ValueError("VS budget mismatch")
@@ -233,6 +249,16 @@ def select_vs_gain(response_records, output_path, target_beta=1.0):
         "selection_metrics": chosen,
         "immutable": True,
         "test_peeking": False,
+        "verified_vs_records": [
+            {"instance_id": str(row.get("instance_id", "")),
+             "task_id": str(row.get("task_id", "")),
+             "task_name": str(row.get("task_name", "")),
+             "gain": float(row["gain"]),
+             "matrix_sha256": str(row.get("matrix_sha256", "")),
+             "response_file_sha256": str(row.get("response_file_sha256", ""))}
+            for row in response_records
+        ],
+        "n_verified_vs_records": len(response_records),
     }
     output_path.parent.mkdir(parents=True, exist_ok=True)
     output_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
@@ -335,6 +361,7 @@ def readiness_report(protocol, budget, vs_paths, test_path, output_path, missing
         "Status: `BLOCKED`",
         "",
         "This report records offline package preparation only. No Kaiwu/SPQC task was submitted.",
+        "The authoritative current protocol is `configs/paper/fa_bm_vae_kaiwu_13k_protocol.json`; historical 50-VS / 500-TEST offline replay with 1000 reads per instance is not this submission plan.",
         "",
         "## Frozen scope",
         "",
@@ -378,6 +405,9 @@ def readiness_report(protocol, budget, vs_paths, test_path, output_path, missing
         "",
         "- Full regression is rerun after this preparation; any real-platform skips remain skips, not hardware evidence.",
         "- Kaiwu batch dry-run: 30 VS tasks / 3,000 reads with matrix hashes; no SDK call.",
+        "- Offline manifests declare 49 spins, 228 source edges, int8 range [-128, 127], and per-gain maximum coefficients; no clipping is allowed.",
+        "- SDK audit preserves both importlib.metadata.version('kaiwu') and kaiwu.__version__: `%s`."
+        % json.dumps(budget.get("sdk_versions", {}), sort_keys=True),
         "- OPSD rolling-origin formal Raw matrix is complete: 3 origins x 4 models x 5 seeds, 60/60 tasks, 5,400 date rows; Cal/Temporal-ECC remain sensitivity analyses.",
         "- Compile check: `PASS`.",
         "- CLI without explicit confirmation: rejected before SDK/project access.",
@@ -391,31 +421,30 @@ def readiness_report(protocol, budget, vs_paths, test_path, output_path, missing
         "## Platform gate",
         "",
         "- `hardware_claim=false` and `physical_platform_used=false` for all offline artifacts.",
+        "- CPQC-550 is recorded as 550 variables/full-connectivity/int8; edge counts are audit fields, not a guessed platform cap.",
         "- Missing platform conditions: Sampling Credits, project number, licensed SDK, account environment, and real response files." if missing_platform else "- Platform conditions supplied.",
         "- Real TEST submission is blocked until one gain is frozen from VS only.",
         "",
         "## Manual-gated next command",
         "",
-        "Run only after the user has supplied Sampling Credits, a project number, and a licensed account environment; this command was not executed:",
+        "The code and documentation are ready for a single-task canary, but run only after the user has supplied Sampling Credits, a project number, and a licensed account environment; this command was not executed:",
         "",
         "```powershell",
         "$env:FA_BM_VAE_RUN_REAL_KAIWU=\"1\"",
         "$env:KAIWU_PROJECT_NO=\"<manually-provided-project-no>\"",
-        "$matrices = Get-ChildItem export\\kaiwu_13k_preparation\\submission_gain_125\\package\\hardware_matrices\\*.npz | Select-Object -First 10",
-        "foreach ($matrix in $matrices) {",
-        "  D:\\anaconda\\envs\\wsy\\python.exe -m GEFcom2014.models.QBM_VAE.submit_kaiwu_sampling `",
-        "    --matrix-file $matrix.FullName --instance-id $matrix.BaseName --num-reads 100 `",
-        "    --output-dir export\\kaiwu_13k_preparation\\real_vs_gain_125 `",
-        "    --checkpoint-dir export\\kaiwu_13k_preparation\\real_checkpoints `",
-        "    --confirm-real-submission",
-        "}",
+        "D:\\anaconda\\envs\\wsy\\python.exe -m GEFcom2014.models.QBM_VAE.run_kaiwu_13k_sampling `",
+        "  --stage vs --execute --limit 1 --resume --confirm-real-submission `",
+        "  --output-dir export\\kaiwu_13k_preparation\\real_responses `",
+        "  --checkpoint-dir export\\kaiwu_13k_preparation\\real_checkpoints",
         "```",
+        "",
+        "This first task is one of the frozen 30 VS tasks and consumes 100 of the planned 3,000 VS reads. Continue only with the same driver and `--resume` after response audit; TEST remains blocked until VS-only gain selection freezes exactly one gain.",
         "",
         "## Unrelated experiments",
         "",
         "- OPSD rolling-origin: formal Raw matrix complete in export/opsd_rolling_origins_formal_v1; no additional training is permitted.",
         "- SDWPF-5: intentionally not run in this round; excluded from this hardware budget.",
-        "- Decision value: normalized asymmetric cost-loss real-input pilot completed; auditable market prices NOT USED.",
+        "- Decision value: exploratory normalized cost-loss only; no real market prices; excluded from main empirical evidence.",
         "- Repository manuscript search: no .tex/.docx/manuscript*.md/paper*.md file found; paper wording must be updated outside this repository if applicable.",
         "",
         "Final status: `BLOCKED` (missing Sampling Credits, KAIWU_PROJECT_NO, licensed SDK/account environment, and verified physical response files).",

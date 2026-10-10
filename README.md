@@ -482,12 +482,15 @@ protocol under simulation, not a physical-platform or quantum advantage
 claim. Full commands and response contracts are documented in
 `GEFcom2014/models/QBM_VAE/README.md`.
 
-The corrected hardware protocol uses a 50-instance VS panel balanced across
-all ten Wind zones and the complete 500-instance TEST pool. Its hash-checked
-end-to-end SA replay recovered `beta_eff=1.0000` with 95% CI
-`[0.9950, 1.0000]`. The real VS submission archive is frozen, while TEST
-packaging is deliberately blocked until responses from the physical platform
-have produced a new VS-only calibration.
+### Historical offline 50/500/1000-read protocol
+
+The historical corrected protocol used a 50-instance VS panel balanced across
+all ten Wind zones and the complete 500-instance TEST pool, with 1000 reads per
+instance. Its hash-checked end-to-end SA replay recovered `beta_eff=1.0000`
+with 95% CI
+`[0.9950, 1.0000]`. The offline VS submission archive is frozen; it is not
+physical-platform evidence. TEST packaging is deliberately blocked until
+verified physical VS responses produce a new VS-only calibration.
 
 ### FA-BM-VAE bosonic/SPQC sampling chain
 
@@ -525,6 +528,17 @@ The generated pickle keeps the existing scenario-array layout and is paired
 with JSON metadata naming **FA-BM-VAE**, recording the platform backend,
 frozen-model path, source manifest, response audit, and `hardware_claim=false`.
 
+The authoritative current submission plan is
+`configs/paper/fa_bm_vae_kaiwu_13k_protocol.json`: training is classical and
+complete before platform use; the platform only replaces frozen conditional
+Ising latent sampling; no physical-platform result exists yet. It uses 10
+stratified VS conditions at each of gains 125, 150, and 200 (30 VS tasks,
+100 reads each, 3,000 reads total), followed only after VS gain calibration by
+100 TEST conditions (100 tasks, 100 reads each, 10,000 reads). The planned
+total is 13,000 reads, the backup allowance is at most 2,000 reads, and the
+application limit is 15,000 reads. TEST gain and matrices remain unresolved
+until one gain is frozen from real VS responses.
+
 For the Kaiwu/SPQC 8-bit path, provide one global gain explicitly when
 exporting. The exporter creates `M`, `Q=round(gain*M)`, a separate 49x49 matrix
 file, and a quantization audit; it never clips or rescales instances
@@ -534,19 +548,21 @@ individually:
 python -m GEFcom2014.models.QBM_VAE.export_ising_instances `
   --tag wind --model-name wind_QBMVAE_2_lanchor_sa_0 `
   --split VS --selection stratified --num-instances 10 `
-  --hardware-gain 100 `
-  --output-dir export\kaiwu_instances\fa_bm_vae_wind_gain100
+  --hardware-gain 125 `
+  --output-dir export\kaiwu_instances\fa_bm_vae_wind_gain125
 
 python -m GEFcom2014.models.QBM_VAE.prepare_bosonic_submission `
-  --manifest export\kaiwu_instances\fa_bm_vae_wind_gain100\wind_wind_QBMVAE_2_lanchor_sa_0_vs_manifest.json `
+  --manifest export\kaiwu_instances\fa_bm_vae_wind_gain125\wind_wind_QBMVAE_2_lanchor_sa_0_vs_manifest.json `
   --stage vs-calibration --requested-reads 100 `
-  --output-dir export\kaiwu_submissions\fa_bm_vae_wind_gain100_vs
+  --output-dir export\kaiwu_submissions\fa_bm_vae_wind_gain125_vs
 ```
 
-The value `100` is a reproducible local preflight candidate, not a frozen
-hardware temperature. Real VS calibration must test several global gains and
-freeze one only after the original `h,J` models and all selected VS instances
-pass the int8 range and sampling diagnostics.
+The current VS candidates are exactly `125`, `150`, and `200`; `125` above is
+only the first offline package example, not a selected gain. Real VS
+calibration must test all three global gains and freeze one only after the
+original `h,J` models and all selected VS instances pass the int8 range and
+sampling diagnostics. Other gain grids in offline-preflight outputs are local
+simulation diagnostics, not the current submission budget.
 
 The Kaiwu response must contain 49 raw spins, the instance ID, a task ID, the
 matrix SHA-256, and index-ascending bit order. The importer stores both
@@ -554,22 +570,21 @@ matrix SHA-256, and index-ascending bit order. The importer stores both
 The latter is the only representation consumed by benchmark and scenario
 reconstruction.
 
-After the platform environment is configured externally, submit one matrix
-explicitly with:
+The single-matrix submit module is an internal primitive, not the public
+execution procedure. All real submissions must go through the resumable batch
+driver so pending intents are checked before any retry:
 
 ```powershell
-python -m GEFcom2014.models.QBM_VAE.submit_kaiwu_sampling `
-  --matrix-file <package>\hardware_matrices\<instance_id>.npz `
-  --instance-id <instance_id> --num-reads 100 `
-  --output-dir export\kaiwu_raw_responses `
-  --checkpoint-dir export\kaiwu_checkpoints
+D:\anaconda\envs\wsy\python.exe -m GEFcom2014.models.QBM_VAE.run_kaiwu_13k_sampling `
+  --stage vs --dry-run --limit 1
 ```
 
-This is the only command in the repository that can submit a Kaiwu task. It
-uses a unique task name and `CIMOptimizer` sampling mode; it requires
-`KAIWU_PROJECT_NO` or an explicit runtime `--project-no`. The checkpoint
-manager is pointed to a task-specific subdirectory below `--checkpoint-dir`;
-the SDK default cache path is never used.
+The first real canary, intentionally not run here, uses the same driver with
+`--execute --limit 1 --resume --confirm-real-submission` after manual platform
+approval. It requires
+`KAIWU_PROJECT_NO`, credits, and a licensed account. If a pending intent has no
+official SDK task-name/task-id query path, the driver stops with “task status
+unknown; manual platform confirmation required” instead of resubmitting.
 
 The real integration suite is opt-in and never runs in the normal regression
 suite. Set `FA_BM_VAE_RUN_REAL_KAIWU=1`, `KAIWU_PROJECT_NO`, and the paths
@@ -580,17 +595,19 @@ $env:FA_BM_VAE_RUN_REAL_KAIWU="1"
 D:\anaconda\envs\wsy\python.exe -m pytest -q tests\test_kaiwu_real_integration.py
 ```
 
-For every hardware run, generate both controls on the identical frozen
-instances:
+For every current-protocol hardware run, generate both controls on the
+identical frozen instances with 100 reads per instance. The historical
+50/500-instance offline experiment used 1000 reads and is not the current
+submission plan:
 
 ```powershell
 python -m GEFcom2014.models.QBM_VAE.sample_exported_ising `
   --manifest <manifest.json> --backend sa --matrix-space logical `
-  --num-reads 1000 --output-dir export\kaiwu_controls
+  --num-reads 100 --output-dir export\kaiwu_controls
 
 python -m GEFcom2014.models.QBM_VAE.sample_exported_ising `
   --manifest <manifest.json> --backend sa --matrix-space hardware-quantized `
-  --num-reads 1000 --output-dir export\kaiwu_controls
+  --num-reads 100 --output-dir export\kaiwu_controls
 ```
 
 These are respectively floating-point logical SA, the same quantized 8-bit
@@ -622,7 +639,11 @@ the SDK license and project number externally, for example through
 the repository. The adapter uses `CIMOptimizer` in `SAMPLING` mode with a
 unique task name. No task is submitted by repository tests.
 
-### Independent OPSD Wind validation
+### Historical OPSD fixed-split validation (3 seeds)
+
+The results in this section are the older fixed single LS/VS/TEST split with
+three seeds. They include the historical Cal/ECC post-processing tables and
+must not be conflated with the newer rolling-origin Raw experiment below.
 
 The external validation uses the fixed Open Power System Data Time Series
 release `2019-06-05` (DOI `10.25832/time_series/2019-06-05`). The source file
@@ -657,7 +678,7 @@ D:\anaconda\envs\wsy\python.exe -m GEFcom2014.models.QBM_VAE.anchor_score_sde --
 D:\anaconda\envs\wsy\python.exe -m GEFcom2014.models.probabilistic_baselines --model residual-bootstrap --tag opsd-wind --dataset-bundle GEFcom2014\data\external\opsd_wind_daily.npz --n-scenarios 100 --seed 0
 ```
 
-Build QBM-ECC and evaluate all complete three-seed pairs:
+The historical fixed-split Cal/ECC commands (three seeds) were:
 
 ```powershell
 D:\anaconda\envs\wsy\python.exe -m GEFcom2014.forecast_quality.qbm_temporal_ecc --tag opsd-wind --dataset-bundle GEFcom2014\data\external\opsd_wind_daily.npz --seeds 0 1 2
@@ -671,7 +692,7 @@ D:\anaconda\envs\wsy\python.exe -m GEFcom2014.forecast_quality.aggregate_unified
 ```
 
 All selected variants are chosen by mean three-seed VS CRPS before TEST is
-evaluated. Current TEST results are:
+evaluated. Historical fixed-split TEST results are:
 
 | Model | Variant | CRPS mean +/- std | Energy | Variogram | Ramp quantile MAE |
 |---|---:|---:|---:|---:|---:|
@@ -761,20 +782,28 @@ corresponding experiments have already been completed.
   date rows, `artifact_role=formal_complete`, and `eligible_for_paper=true`.
   The independent statistical outputs are written to
   `export/opsd_rolling_origins_formal_v1_analysis`; Raw remains the primary
-  result and Cal/Temporal-ECC are sensitivities only.
+  result and Cal/Temporal-ECC are sensitivities only. The current Cal/ECC
+  artifacts are VS-only; TEST-side Cal/ECC sensitivity evaluation is not yet
+  complete.
 - **Core seed coverage:** the current primary comparison is FA-BM-VAE,
-  Forecast-anchored Gaussian, GMM-4, Score-SDE, D3U and Treeffuser.  Main
-  GEFCom Wind seed 3/4 jobs for the first four models remain **NOT RUN**;
-  exploratory/ablation seeds are not counted as primary replication.
-- **Decision value:** the current implementation is a normalized asymmetric
-  cost-loss sensitivity analysis because no auditable market-price file is
-  present.  It must not be described as a market-profit result until common
-  prices, constraints and dates are supplied for every model.  The smoke test
-  is synthetic and **NOT a paper result**.
+  Forecast-anchored Gaussian, GMM-4, Score-SDE, D3U and Treeffuser.  The
+  GEFCom Wind comparison now has paired VS/TEST artifacts for seeds 0--4 for
+  all six families.  The strict Raw audit and five-seed aggregation are under
+  `export/wind_five_seed_comparison`; the separate Cal/Temporal-ECC
+  sensitivity artifacts are under its `cal_ecc_sensitivity` subdirectory.
+  The tracked provenance inventory is `docs/FA_BM_VAE_PROVENANCE.md`.
+  The older FA-BM-VAE seed 0--2 JSON files do not record the negative-phase
+  backend, and none of the five historical artifacts independently records
+  TEST-selection status. These fields remain `NOT_RECORDED`, not `false`.
+- **Decision value (optional; not a completion gate):** the retained implementation is an exploratory normalized
+  asymmetric cost-loss analysis without real market prices. It is excluded
+  from the main empirical evidence, contribution claims and conclusions; it
+  must not be described as economic return or market profit. The smoke test is
+  synthetic and **NOT a paper result**.
 - **Metric protocol:** Raw scenario metrics are primary. Calibrated and
-  model-independent temporal-ECC outputs are pre-registered sensitivities and
-  must fit only on LS/VS; TEST is evaluation-only. A QBM/FA-BM template is an
-  additional sensitivity, never the default ECC template.
+  temporal-ECC artifacts are retained for provenance but are not reported as
+  results in the current paper. If a public protocol registered them, their
+  omission must be disclosed as a protocol change; TEST remains evaluation-only.
 - **FA-BM-VAE scope:** training remains classical; Forecast Anchor models the
   main trend and the conditional BM/VAE models residual uncertainty.  Kaiwu,
   CIM or another bosonic platform may replace only the frozen latent sampling
@@ -791,9 +820,26 @@ corresponding experiments have already been completed.
   from all tables, statistical claims, and conclusions. Formal multi-turbine
   spatiotemporal validation is reserved for future work.
 
-The reported conclusions remain conservative: on GEFCom2014 GMM-4 has mean
-CRPS 0.082830 versus approximately 0.083382/0.083418 for FA-BM-VAE; on OPSD,
-FA-BM-VAE-SA has the lowest point estimate (0.027284) but no stable significant
-advantage over Gaussian or Score-SDE.  Forecast Anchor is the main improvement
-source, while the Temporal-MI graph has no stable advantage over a matched
-random graph.
+The historical fixed-split OPSD Cal/ECC table is retained for provenance only.
+It is not the current rolling-origin primary result, and the historical
+`0.027284` FA-BM-VAE-SA value must not be presented as a general OPSD claim.
+
+The current formal rolling-origin Raw result is:
+
+| Model | Mean Raw CRPS |
+|---|---:|
+| Forecast-anchored Gaussian | 0.025914 |
+| FA-BM-VAE | 0.025962 |
+| Score-SDE | 0.026157 |
+| GMM-4 | 0.028782 |
+
+Gaussian versus FA-BM-VAE and Score-SDE versus FA-BM-VAE are not significant;
+FA-BM-VAE is significantly better than GMM-4. Score-SDE is better on
+Variogram and ramp-CRPS. These results do not support a claim that FA-BM-VAE
+is universally leading, equivalent, lossless, or quantum-advantaged. The
+current OPSD Cal/ECC work is VS-only; TEST-side Cal/ECC sensitivity evaluation
+has not been completed. Raw remains the primary endpoint.
+
+Decision value is exploratory normalized cost-loss analysis without real market
+prices. It is not an economic-return result and is excluded from the main
+empirical evidence, contribution claims, and conclusions.

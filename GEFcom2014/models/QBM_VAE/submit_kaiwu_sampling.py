@@ -19,6 +19,7 @@ import numpy as np
 from .kaiwu_adapter import (
     KaiwuClient,
     build_task_name,
+    kaiwu_sdk_versions,
     matrix_sha256,
     validate_hardware_matrix,
     validate_sampling_reads,
@@ -50,6 +51,8 @@ def submit_one(
     project_no=None,
     checkpoint_dir=None,
     task_name=None,
+    stage="vs-calibration",
+    hardware_gain=None,
     wait=True,
     interval=1,
 ):
@@ -82,6 +85,7 @@ def submit_one(
     sdk_version = str(
         getattr(client._kaiwu, "__version__", "unknown")
     )
+    sdk_versions = kaiwu_sdk_versions(client._kaiwu)
     platform_backend = "kaiwu.cim.CIMOptimizer"
     completed_at = datetime.now(timezone.utc).isoformat()
     returned_reads = int(np.asarray(result["samples"]).shape[0])
@@ -96,17 +100,32 @@ def submit_one(
         bit_order=np.asarray("index_ascending"),
         backend=np.asarray(metadata.get("backend", "kaiwu_cim_sampling")),
         sdk_version=np.asarray(sdk_version),
+        kaiwu_distribution_version=np.asarray(
+            sdk_versions["importlib_metadata_version"] or ""
+        ),
+        kaiwu_module_version=np.asarray(sdk_versions["kaiwu_module_version"] or ""),
         platform_backend=np.asarray(platform_backend),
         submitted_at=np.asarray(submitted_at),
         completed_at=np.asarray(completed_at),
         requested_reads=np.asarray(num_reads),
         returned_reads=np.asarray(returned_reads),
+        stage=np.asarray(stage),
+        hardware_gain=np.asarray(-1.0 if hardware_gain is None else float(hardware_gain)),
+        # Raw platform output is never itself a hardware conclusion.  The
+        # external audit is the only place allowed to promote these flags.
+        hardware_claim=np.asarray(False),
+        physical_platform_used=np.asarray(False),
         checkpoint_dir=np.asarray(str(checkpoint_path)),
     )
     response_hash = hashlib.sha256(output_path.read_bytes()).hexdigest()
     task_id = str(metadata.get("task_id", ""))
     platform_metadata_complete = bool(
+        client.__class__.__module__ == "GEFcom2014.models.QBM_VAE.kaiwu_adapter" and
         task_id and task_name and sdk_version and platform_backend and
+        str(metadata.get("task_name", "")) == str(task_name) and
+        str(metadata.get("backend", "")).startswith("kaiwu") and
+        sdk_versions["importlib_metadata_version"] and
+        sdk_versions["kaiwu_module_version"] and
         submitted_at and completed_at and matrix_hash and response_hash and
         returned_reads == int(num_reads)
     )
@@ -114,13 +133,17 @@ def submit_one(
         "method_name": "FA-BM-VAE",
         "training_backend": "classical",
         "sampling_stage": "post_training_conditional_ising_latent",
-        "hardware_claim": platform_metadata_complete,
-        "physical_platform_used": platform_metadata_complete,
+        "stage": str(stage),
+        "gain": None if hardware_gain is None else float(hardware_gain),
+        "hardware_claim": False,
+        "physical_platform_used": False,
+        "completed": False,
         "instance_id": str(instance_id),
         "task_id": str(metadata.get("task_id", "")),
         "task_name": str(metadata.get("task_name", task_name)),
         "matrix_sha256": matrix_hash,
         "sdk_version": sdk_version,
+        "sdk_versions": sdk_versions,
         "platform_backend": platform_backend,
         "submitted_at": submitted_at,
         "completed_at": completed_at,
@@ -131,6 +154,15 @@ def submit_one(
         "response_file_sha256": response_hash,
         "response_path": str(output_path.resolve()),
     }
+    # Validate the NPZ contents before promoting the audit flags.  A mock
+    # client, incomplete metadata, malformed samples, or any hash mismatch
+    # leaves the audit explicitly non-physical.
+    if platform_metadata_complete:
+        from .import_hardware_responses import strict_response_record_valid
+        candidate = dict(audit, hardware_claim=True,
+                         physical_platform_used=True, completed=True)
+        if strict_response_record_valid(candidate):
+            audit.update(candidate)
     audit_path = output_dir / (str(instance_id) + ".json")
     audit_path.write_text(json.dumps(audit, indent=2), encoding="utf-8")
     return output_path, audit_path, audit

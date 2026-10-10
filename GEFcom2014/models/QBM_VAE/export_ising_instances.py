@@ -220,7 +220,9 @@ def main():
         if hardware_problem is not None:
             payload["hardware_matrix_file"] = relative_or_absolute(hardware_matrix_path)
             payload["task_name"] = build_task_name(
-                stem, hardware_problem["audit"]["matrix_sha256"]
+                stem, hardware_problem["audit"]["matrix_sha256"],
+                stage=("vs-calibration" if args.split == "VS" else "test-evaluation"),
+                gain=args.hardware_gain,
             )
         json_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
         scale_to_unit = 1.0 / max(float(np.abs(h).max()), float(np.abs(j).max()), 1e-12)

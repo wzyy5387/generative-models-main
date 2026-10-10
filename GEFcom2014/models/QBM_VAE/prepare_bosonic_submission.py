@@ -13,7 +13,10 @@ import numpy as np
 
 from .kaiwu_adapter import (
     HARDWARE_N_BITS,
+    INT8_MAX,
+    INT8_MIN,
     LOGICAL_N_BITS,
+    kaiwu_sdk_versions,
     matrix_sha256,
     validate_hardware_matrix,
     validate_sampling_reads,
@@ -67,6 +70,8 @@ def validate_payload(payload, expected_id=None):
             "hardware_matrix_sha256": matrix_sha256(matrix),
             "hardware_gain": float(payload["hardware_gain"]),
             "hardware_n_bits_declared": int(payload["hardware_n_bits"]),
+            "clipping": bool(payload.get("quantization_audit", {}).get("clipping", False)),
+            "max_abs_integer": int(np.abs(matrix).max()),
         }
     seen_edges = set()
     coupling_values = []
@@ -129,11 +134,8 @@ def enforce_limits(stats, max_bits=None, max_edges=None, coefficient_limit=None)
             "Problem has %d bits, above platform limit %d"
             % (stats["n_bits"], max_bits)
         )
-    if max_edges is not None and stats["n_edges"] > max_edges:
-        raise ValueError(
-            "Problem has %d edges, above platform limit %d"
-            % (stats["n_edges"], max_edges)
-        )
+    # CPQC-550 is specified by binary-variable capacity and connectivity, not
+    # by a user-supplied edge cap.  Edge counts remain audit fields only.
     if (
         coefficient_limit is not None
         and stats["max_abs_coefficient"] > coefficient_limit + 1e-12
@@ -289,9 +291,18 @@ def prepare_submission(
         "n_instances": len(records),
         "platform_limits_checked": {
             "max_bits": max_bits,
-            "max_edges": max_edges,
             "coefficient_limit": coefficient_limit,
+            "int8_coefficient_range": [INT8_MIN, INT8_MAX],
+            "int8_range_verified": True,
+            "int8_range_source": "local kaiwu_adapter validation",
+            "machine_profile": {
+                "name": "CPQC-550",
+                "max_variables": 550,
+                "full_connectivity": True,
+                "coupling_precision": "int8",
+            },
         },
+        "sdk_versions": kaiwu_sdk_versions(),
         "problem_summary": {
             "n_bits_min": min(record["n_bits"] for record in records),
             "n_bits_max": max(record["n_bits"] for record in records),

@@ -10,6 +10,7 @@ from GEFcom2014.models.QBM_VAE.kaiwu_adapter import (
     KaiwuClient,
     binary_to_spin,
     hardware_matrix_from_ising,
+    kaiwu_sdk_versions,
     matrix_sha256,
     normalize_hardware_spins,
     quantize_hardware_matrix,
@@ -19,6 +20,32 @@ from GEFcom2014.models.QBM_VAE.export_ising_instances import build_platform_payl
 from GEFcom2014.models.QBM_VAE.prepare_bosonic_submission import prepare_submission
 from GEFcom2014.models.QBM_VAE.submit_kaiwu_sampling import submit_one
 from GEFcom2014.models.QBM_VAE import sample_exported_ising
+
+
+def test_kaiwu_sdk_audit_keeps_distribution_and_module_versions(monkeypatch):
+    monkeypatch.setattr(
+        "importlib.metadata.version", lambda name: "1.4.1"
+    )
+    versions = kaiwu_sdk_versions(SimpleNamespace(__version__="1.0.7"))
+    assert versions == {
+        "importlib_metadata_version": "1.4.1",
+        "kaiwu_module_version": "1.0.7",
+        "version_mismatch": True,
+    }
+
+
+def test_task_name_is_deterministic_for_retries():
+    from GEFcom2014.models.QBM_VAE.kaiwu_adapter import build_task_name
+    first = build_task_name("i/1", "a" * 64, protocol_id="p", stage="vs", gain=125)
+    second = build_task_name("i/1", "a" * 64, protocol_id="p", stage="vs", gain=125)
+    assert first == second
+    assert "125" in first and "a" * 12 in first
+
+
+def test_current_sdk_has_no_task_name_query_capability():
+    from GEFcom2014.models.QBM_VAE.kaiwu_adapter import load_kaiwu_sdk, official_task_query_capability
+    _, optimizer_cls, _ = load_kaiwu_sdk()
+    assert official_task_query_capability(optimizer_cls) is None
 
 
 def test_auxiliary_matrix_matches_original_energy_by_enumeration():
@@ -226,6 +253,10 @@ def test_submit_one_uses_task_checkpoint_and_records_runtime_audit(tmp_path, mon
     assert audit["matrix_sha256"] == matrix_sha256(matrix)
     assert audit["checkpoint_dir"] == str(expected_checkpoint.resolve())
     assert output_path.is_file() and audit_path.is_file()
+    assert audit["hardware_claim"] is False
+    with np.load(output_path) as raw:
+        assert bool(raw["hardware_claim"]) is False
+        assert bool(raw["physical_platform_used"]) is False
 
 
 def test_quantized_sa_uses_matrix_beta_and_records_beta_scales(tmp_path, monkeypatch):

@@ -11,8 +11,9 @@ variable splitting, or platform submission happens in the NumPy functions.
 
 import hashlib
 import importlib
+import importlib.metadata
+import inspect
 import os
-import uuid
 
 import numpy as np
 
@@ -24,6 +25,25 @@ INT8_MIN = -128
 INT8_MAX = 127
 MIN_SAMPLING_READS = 10
 MAX_SAMPLING_READS = 2000
+
+
+def kaiwu_sdk_versions(kaiwu_module=None):
+    """Return both distribution and imported-module Kaiwu versions."""
+    try:
+        distribution = importlib.metadata.version("kaiwu")
+    except importlib.metadata.PackageNotFoundError:
+        distribution = None
+    if kaiwu_module is None:
+        try:
+            kaiwu_module = importlib.import_module("kaiwu")
+        except ImportError:
+            kaiwu_module = None
+    module = getattr(kaiwu_module, "__version__", None)
+    return {
+        "importlib_metadata_version": distribution,
+        "kaiwu_module_version": module,
+        "version_mismatch": bool(distribution and module and distribution != module),
+    }
 
 
 def _validate_logical_ising(h, j, logical_n_bits=LOGICAL_N_BITS):
@@ -177,10 +197,18 @@ def validate_sampling_reads(num_reads):
     return num_reads
 
 
-def build_task_name(instance_id, matrix_hash, run_id=None):
-    suffix = run_id or uuid.uuid4().hex[:12]
+def build_task_name(instance_id, matrix_hash, run_id=None, protocol_id="fa-bm-vae-kaiwu-13k-v1",
+                    stage="vs-calibration", gain=None):
+    """Derive a stable task name from immutable protocol inputs.
+
+    ``run_id`` is retained for source compatibility but is ignored: a retry must
+    never manufacture a billable second task for the same matrix.
+    """
     safe_instance = "".join(ch if ch.isalnum() or ch in "-_" else "_" for ch in str(instance_id))
-    return "fa_bm_vae_%s_%s_%s" % (safe_instance, matrix_hash[:12], suffix)
+    safe_protocol = "".join(ch if ch.isalnum() or ch in "-_" else "_" for ch in str(protocol_id))
+    safe_stage = "".join(ch if ch.isalnum() or ch in "-_" else "_" for ch in str(stage))
+    gain_part = "na" if gain is None else str(gain).replace(".", "_")
+    return "fa_bm_vae_%s_%s_%s_g%s_%s" % (safe_protocol, safe_stage, safe_instance, gain_part, str(matrix_hash)[:16])
 
 
 def load_kaiwu_sdk():
@@ -197,6 +225,32 @@ def load_kaiwu_sdk():
     if optimizer_cls is None or task_mode is None:
         raise RuntimeError("Installed Kaiwu SDK does not expose kaiwu.cim.CIMOptimizer/TaskMode")
     return kaiwu, optimizer_cls, task_mode
+
+
+def official_task_query_capability(optimizer_cls=None):
+    """Return a public task-name/task-id query method, if the SDK exposes one.
+
+    Private SDK helpers and matrix-only ``get_task_result(ising_matrix)`` are
+    deliberately excluded: using either to guess a submitted task could create
+    a second billable task.
+    """
+    if optimizer_cls is None:
+        try:
+            _, optimizer_cls, _ = load_kaiwu_sdk()
+        except RuntimeError:
+            return None
+    for name in ("query_task", "query_task_result", "get_task_by_name",
+                 "get_task_by_id", "get_task_result_by_name", "get_task_result_by_id"):
+        method = getattr(optimizer_cls, name, None)
+        if not callable(method):
+            continue
+        try:
+            parameters = inspect.signature(method).parameters
+        except (TypeError, ValueError):
+            continue
+        if "task_name" in parameters or "task_id" in parameters:
+            return name
+    return None
 
 
 class KaiwuClient:

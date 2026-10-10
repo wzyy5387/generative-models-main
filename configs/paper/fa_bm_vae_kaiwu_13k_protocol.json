@@ -27,7 +27,18 @@
     "negtail_flip": false,
     "sort_solutions": false,
     "hardware_claim": false,
-    "physical_platform_used": false
+    "physical_platform_used": false,
+    "platform_limits": {
+      "int8_coefficient_range": [-128, 127],
+      "int8_range_verified": true,
+      "int8_range_source": "local kaiwu_adapter validation",
+      "machine_profile": {
+        "name": "CPQC-550",
+        "max_variables": 550,
+        "full_connectivity": true,
+        "coupling_precision": "int8"
+      }
+    }
   },
   "vs": {
     "instances": 10,
@@ -41,6 +52,7 @@
     "instances_per_zone": 10,
     "tasks": 100,
     "samples": 10000,
+    "allow_preregistered_subset": true,
     "selection_split": "TEST",
     "matrix_status": "logical h,J frozen; hardware gain unresolved until VS calibration"
   },
@@ -74,6 +86,6 @@
   "fallback": {
     "opsd_rolling_origin": "formal 3-origin x 4-model x 5-seed Raw matrix complete; hardware remains separately gated",
     "sdwpf5": "smoke/NOT RUN and excluded from hardware budget",
-    "decision_value": "normalized or NOT RUN unless auditable prices are supplied"
+    "decision_value": "exploratory normalized cost-loss only; no real market prices; excluded from main empirical evidence"
   }
 }

@@ -17,6 +17,77 @@ ROOT_DIR = Path(__file__).resolve().parents[3]
 DEFAULT_OUTPUT_DIR = ROOT_DIR / "export" / "bosonic_responses" / "imported"
 
 
+def strict_response_record_valid(record, expected=None):
+    """Validate both the audit record and the raw 49-spin NPZ contents."""
+    if not isinstance(record, dict) or record.get("completed") is not True:
+        return False
+    required = ("instance_id", "stage", "task_id", "task_name", "matrix_sha256",
+                "response_file_sha256", "requested_reads", "returned_reads",
+                "response_path", "gain", "sdk_version", "platform_backend")
+    if any(not str(record.get(key, "")) for key in required):
+        return False
+    if record.get("hardware_claim") is not True or record.get("physical_platform_used") is not True:
+        return False
+    try:
+        requested = int(record["requested_reads"])
+        returned = int(record["returned_reads"])
+    except (TypeError, ValueError):
+        return False
+    if requested != returned or returned <= 0:
+        return False
+    response = Path(record["response_path"])
+    if not response.is_file() or response.suffix.lower() != ".npz":
+        return False
+    try:
+        if sha256_file(response) != str(record["response_file_sha256"]):
+            return False
+        with np.load(response, allow_pickle=False) as archive:
+            samples = np.asarray(archive["samples"])
+            if samples.shape != (returned, 49) or not np.isin(samples, (-1, 1)).all():
+                return False
+            fields = {
+                "instance_id": record["instance_id"],
+                "task_id": record["task_id"],
+                "task_name": record["task_name"],
+                "matrix_sha256": record["matrix_sha256"],
+                "stage": record["stage"],
+                "hardware_gain": record["gain"],
+                "requested_reads": requested,
+                "returned_reads": returned,
+            }
+            for key, expected_value in fields.items():
+                if key not in archive:
+                    return False
+                value = np.asarray(archive[key]).reshape(-1)
+                if value.size != 1:
+                    return False
+                actual = value[0].item()
+                if key == "hardware_gain":
+                    if float(actual) != float(expected_value):
+                        return False
+                elif str(actual) != str(expected_value):
+                    return False
+    except (OSError, KeyError, TypeError, ValueError, IndexError):
+        return False
+    if expected:
+        for key in ("stage", "instance_id", "gain", "matrix_sha256", "requested_reads", "task_name"):
+            if key in expected:
+                if key == "gain":
+                    try:
+                        if float(record.get(key)) != float(expected[key]):
+                            return False
+                    except (TypeError, ValueError):
+                        return False
+                elif str(record.get(key)) != str(expected[key]):
+                    return False
+    if record.get("platform_backend") != "kaiwu.cim.CIMOptimizer":
+        return False
+    versions = record.get("sdk_versions", {})
+    if not isinstance(versions, dict) or not versions.get("importlib_metadata_version") or not versions.get("kaiwu_module_version"):
+        return False
+    return True
+
+
 def expand_samples(samples, n_bits, zero_spin=-1, reverse=False):
     samples = np.asarray(samples)
     if samples.ndim == 1:
@@ -80,11 +151,15 @@ def read_json_response(path, n_bits):
             "backend",
             "platform_metadata",
             "sdk_version",
+            "kaiwu_distribution_version",
+            "kaiwu_module_version",
             "platform_backend",
             "submitted_at",
             "completed_at",
             "requested_reads",
             "returned_reads",
+            "hardware_claim",
+            "physical_platform_used",
             "checkpoint_dir",
         )
         if key in data
@@ -127,11 +202,15 @@ def read_csv_response(path, n_bits):
             "job_id",
             "backend",
             "sdk_version",
+            "kaiwu_distribution_version",
+            "kaiwu_module_version",
             "platform_backend",
             "submitted_at",
             "completed_at",
             "requested_reads",
             "returned_reads",
+            "hardware_claim",
+            "physical_platform_used",
             "checkpoint_dir",
         )
         if key in fields and rows[0][key] != ""
@@ -160,11 +239,15 @@ def read_npz_response(path, n_bits):
             "applied_scale",
             "backend",
             "sdk_version",
+            "kaiwu_distribution_version",
+            "kaiwu_module_version",
             "platform_backend",
             "submitted_at",
             "completed_at",
             "requested_reads",
             "returned_reads",
+            "hardware_claim",
+            "physical_platform_used",
             "checkpoint_dir",
         ):
             if key in response:
@@ -312,12 +395,18 @@ def import_responses(
         platform_complete = bool(
             is_hardware_response and task_id and metadata.get("task_name") and
             metadata.get("sdk_version") and metadata.get("platform_backend") and
+            str(metadata.get("platform_backend")) == "kaiwu.cim.CIMOptimizer" and
+            metadata.get("kaiwu_distribution_version") and
+            metadata.get("kaiwu_module_version") and
             metadata.get("submitted_at") and metadata.get("completed_at") and
             response_matrix_hash and sha256_file(response_path) and
-            samples.shape[0] == submission["requested_reads_per_instance"]
+            int(metadata.get("requested_reads", submission["requested_reads_per_instance"])) == submission["requested_reads_per_instance"] and
+            int(metadata.get("returned_reads", samples.shape[0])) == samples.shape[0] and
+            samples.shape[0] == submission["requested_reads_per_instance"] and
+            True
         )
-        response_arrays["hardware_claim"] = bool(platform_complete)
-        response_arrays["physical_platform_used"] = bool(platform_complete)
+        response_arrays["hardware_claim"] = False
+        response_arrays["physical_platform_used"] = False
         if is_hardware_response:
             response_arrays.update(
                 {
@@ -333,6 +422,8 @@ def import_responses(
         records.append(
             {
                 "instance_id": instance_id,
+                "stage": submission["stage"],
+                "gain": instance.get("hardware_gain"),
                 "n_reads": int(samples.shape[0]),
                 "expected_reads": submission["requested_reads_per_instance"],
                 "read_count_matches": bool(
@@ -352,13 +443,18 @@ def import_responses(
                 "hardware_matrix_sha256": matrix_hash,
                 "task_name": str(metadata.get("task_name", "")),
                 "sdk_version": str(metadata.get("sdk_version", "")),
+                "sdk_versions": {
+                    "importlib_metadata_version": str(metadata.get("kaiwu_distribution_version", "")),
+                    "kaiwu_module_version": str(metadata.get("kaiwu_module_version", "")),
+                },
                 "platform_backend": str(metadata.get("platform_backend", "")),
                 "submitted_at": str(metadata.get("submitted_at", "")),
                 "completed_at": str(metadata.get("completed_at", "")),
                 "response_file_sha256": sha256_file(response_path),
                 "checkpoint_dir": str(metadata.get("checkpoint_dir", "")),
-                "hardware_claim": bool(platform_complete),
-                "physical_platform_used": bool(platform_complete),
+                "hardware_claim": False,
+                "physical_platform_used": False,
+                "hardware_metadata_complete": bool(platform_complete),
             }
         )
     audit = {
