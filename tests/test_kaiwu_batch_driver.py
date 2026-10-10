@@ -1,6 +1,7 @@
 import subprocess
 import sys
 import json
+from types import SimpleNamespace
 
 import pytest
 import hashlib
@@ -12,6 +13,7 @@ from GEFcom2014.models.QBM_VAE.run_kaiwu_13k_sampling import (
     planned_tasks,
     select_pending_tasks,
     _validate_execution_limits,
+    run,
 )
 from GEFcom2014.models.QBM_VAE.import_hardware_responses import strict_response_record_valid
 
@@ -22,6 +24,49 @@ def test_kaiwu_batch_default_dry_run_lists_frozen_budget():
     result = subprocess.run(command, capture_output=True, text=True, check=True)
     assert "tasks=30 reads=3000 dry_run=True" in result.stdout
     assert "matrix_sha256=" in result.stdout
+
+
+def test_spqc550_without_project_no_reaches_mocked_submit(tmp_path, monkeypatch):
+    calls = []
+    task = {"stage": "vs", "instance_id": "vs_000", "gain": 125,
+            "matrix_sha256": "frozen-hash", "reads": 100, "matrix": tmp_path / "matrix.npz"}
+    monkeypatch.delenv("KAIWU_PROJECT_NO", raising=False)
+    monkeypatch.delenv("FA_BM_VAE_RUN_REAL_KAIWU", raising=False)
+    monkeypatch.setattr(
+        "GEFcom2014.models.QBM_VAE.run_kaiwu_13k_sampling.load_protocol",
+        lambda _: {"protocol_version": "test-protocol"},
+    )
+    monkeypatch.setattr(
+        "GEFcom2014.models.QBM_VAE.run_kaiwu_13k_sampling.planned_tasks",
+        lambda *args: [task],
+    )
+    monkeypatch.setattr(
+        "GEFcom2014.models.QBM_VAE.run_kaiwu_13k_sampling._validate_execution_limits",
+        lambda tasks: None,
+    )
+
+    def fake_submit(*args, **kwargs):
+        calls.append(kwargs)
+        raise RuntimeError("mock-only submit reached")
+
+    monkeypatch.setattr(
+        "GEFcom2014.models.QBM_VAE.run_kaiwu_13k_sampling.submit_one",
+        fake_submit,
+    )
+    args = SimpleNamespace(stage="vs", protocol=tmp_path / "protocol.json",
+                           preparation=tmp_path, output_dir=tmp_path / "responses",
+                           checkpoint_dir=tmp_path / "checkpoints", resume=True,
+                           limit=1, execute=True, confirm_real_submission=False,
+                           project_no=None)
+    with pytest.raises(RuntimeError, match="Real batch requires"):
+        run(args)
+    assert not calls
+    args.confirm_real_submission = True
+    monkeypatch.setenv("FA_BM_VAE_RUN_REAL_KAIWU", "1")
+    with pytest.raises(RuntimeError, match="mock-only submit reached"):
+        run(args)
+    assert calls[0]["project_no"] is None
+    assert list((tmp_path / "checkpoints").glob("*.intent.json"))
 
 
 def test_real_execution_checks_cpqc550_profile(tmp_path):

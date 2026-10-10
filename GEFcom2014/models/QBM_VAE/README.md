@@ -264,13 +264,13 @@ gain. No TEST result may select or alter that gain. The old 50-VS / 500-TEST /
 13,000-read submission plan.
 
 The code and documentation are ready for a manually gated single-task canary,
-but submission is blocked until Sampling Credits, `KAIWU_PROJECT_NO`, and a
-licensed SDK/account environment are supplied. The first canary is intentionally
+but submission is blocked until Sampling Credits and a licensed SDK/account
+environment are verified. `KAIWU_PROJECT_NO` is optional for standard SPQC-550
+tasks. The first canary is intentionally
 not run here:
 
 ```powershell
 $env:FA_BM_VAE_RUN_REAL_KAIWU="1"
-$env:KAIWU_PROJECT_NO="<manually-provided-project-no>"
 D:\anaconda\envs\wsy\python.exe -m GEFcom2014.models.QBM_VAE.run_kaiwu_13k_sampling `
   --stage vs --execute --limit 1 --resume --confirm-real-submission `
   --output-dir export\kaiwu_13k_preparation\real_responses `

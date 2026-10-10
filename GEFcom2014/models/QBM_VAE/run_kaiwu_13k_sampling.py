@@ -367,8 +367,6 @@ def run(args):
     if not args.confirm_real_submission or os.environ.get("FA_BM_VAE_RUN_REAL_KAIWU") != "1":
         raise RuntimeError("Real batch requires --confirm-real-submission and FA_BM_VAE_RUN_REAL_KAIWU=1")
     project_no = args.project_no or os.environ.get("KAIWU_PROJECT_NO")
-    if not project_no:
-        raise RuntimeError("KAIWU_PROJECT_NO/project number is required")
     output_dir.mkdir(parents=True, exist_ok=True)
     for item in tasks:
         response_dir = output_dir / ("gain_%d" % item["gain"])

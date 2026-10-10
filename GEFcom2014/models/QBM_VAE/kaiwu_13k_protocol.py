@@ -422,16 +422,15 @@ def readiness_report(protocol, budget, vs_paths, test_path, output_path, missing
         "",
         "- `hardware_claim=false` and `physical_platform_used=false` for all offline artifacts.",
         "- CPQC-550 is recorded as 550 variables/full-connectivity/int8; edge counts are audit fields, not a guessed platform cap.",
-        "- Missing platform conditions: Sampling Credits, project number, licensed SDK, account environment, and real response files." if missing_platform else "- Platform conditions supplied.",
+        "- Missing platform conditions: verified Sampling Credits, licensed SDK/account environment, and real response files." if missing_platform else "- Platform conditions supplied.",
         "- Real TEST submission is blocked until one gain is frozen from VS only.",
         "",
         "## Manual-gated next command",
         "",
-        "The code and documentation are ready for a single-task canary, but run only after the user has supplied Sampling Credits, a project number, and a licensed account environment; this command was not executed:",
+        "The code and documentation are ready for a single-task canary, but run only after Sampling Credits and a licensed account environment are verified; project_no is optional for standard SPQC-550 tasks. This command was not executed:",
         "",
         "```powershell",
         "$env:FA_BM_VAE_RUN_REAL_KAIWU=\"1\"",
-        "$env:KAIWU_PROJECT_NO=\"<manually-provided-project-no>\"",
         "D:\\anaconda\\envs\\wsy\\python.exe -m GEFcom2014.models.QBM_VAE.run_kaiwu_13k_sampling `",
         "  --stage vs --execute --limit 1 --resume --confirm-real-submission `",
         "  --output-dir export\\kaiwu_13k_preparation\\real_responses `",
@@ -447,7 +446,7 @@ def readiness_report(protocol, budget, vs_paths, test_path, output_path, missing
         "- Decision value: exploratory normalized cost-loss only; no real market prices; excluded from main empirical evidence.",
         "- Repository manuscript search: no .tex/.docx/manuscript*.md/paper*.md file found; paper wording must be updated outside this repository if applicable.",
         "",
-        "Final status: `BLOCKED` (missing Sampling Credits, KAIWU_PROJECT_NO, licensed SDK/account environment, and verified physical response files).",
+        "Final status: `BLOCKED` (Sampling Credits and licensed SDK/account environment not yet verified; no physical response files).",
     ]
     output_path = Path(output_path)
     output_path.parent.mkdir(parents=True, exist_ok=True)

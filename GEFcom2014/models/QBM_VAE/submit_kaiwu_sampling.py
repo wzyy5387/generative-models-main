@@ -3,7 +3,7 @@
 """Submit one frozen FA-BM-VAE 49-spin matrix to Kaiwu in SAMPLING mode.
 
 This command is intentionally opt-in. It requires an externally configured
-Kaiwu SDK/license/project number and is never called by tests or training.
+Kaiwu SDK/license; project_no is optional for standard SPQC tasks.
 """
 
 import argparse
@@ -205,8 +205,6 @@ def main():
         raise RuntimeError(
             "Set FA_BM_VAE_RUN_REAL_KAIWU=1 only in an approved hardware environment"
         )
-    if not args.project_no and not os.environ.get("KAIWU_PROJECT_NO"):
-        raise RuntimeError("A runtime project number is required for real submission")
     output_path, audit_path, _ = submit_one(
         matrix_file=args.matrix_file,
         instance_id=args.instance_id,

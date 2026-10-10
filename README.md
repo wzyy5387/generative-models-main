@@ -582,16 +582,19 @@ D:\anaconda\envs\wsy\python.exe -m GEFcom2014.models.QBM_VAE.run_kaiwu_13k_sampl
 The first real canary, intentionally not run here, uses the same driver with
 `--execute --limit 1 --resume --confirm-real-submission` after manual platform
 approval. It requires
-`KAIWU_PROJECT_NO`, credits, and a licensed account. If a pending intent has no
+credits and a licensed account; `KAIWU_PROJECT_NO` is optional for standard
+SPQC-550 tasks. If a pending intent has no
 official SDK task-name/task-id query path, the driver stops with “task status
 unknown; manual platform confirmation required” instead of resubmitting.
 
 The real integration suite is opt-in and never runs in the normal regression
-suite. Set `FA_BM_VAE_RUN_REAL_KAIWU=1`, `KAIWU_PROJECT_NO`, and the paths
+suite. It submits additional paid tasks: set both `FA_BM_VAE_RUN_REAL_KAIWU=1`
+and `FA_BM_VAE_RUN_REAL_KAIWU_TESTS=1`, plus the paths
 listed in `tests/test_kaiwu_real_integration.py`, then run:
 
 ```powershell
 $env:FA_BM_VAE_RUN_REAL_KAIWU="1"
+$env:FA_BM_VAE_RUN_REAL_KAIWU_TESTS="1"
 D:\anaconda\envs\wsy\python.exe -m pytest -q tests\test_kaiwu_real_integration.py
 ```
 
@@ -634,10 +637,11 @@ This command is VS-only and uses local SA to create a deliberately labelled
 mock response. It never imports or calls the Kaiwu SDK.
 
 Kaiwu integration is optional and lazy. The runtime environment must provide
-the SDK license and project number externally, for example through
-`KAIWU_PROJECT_NO`; no account, license, project number, or key is stored in
-the repository. The adapter uses `CIMOptimizer` in `SAMPLING` mode with a
-unique task name. No task is submitted by repository tests.
+the SDK license externally; `KAIWU_PROJECT_NO` is optional and intended for
+project-scoped tasks, not required for standard SPQC-550. No account, license,
+project number, or key is stored in the repository. The adapter uses
+`CIMOptimizer` in `SAMPLING` mode with a
+unique task name. The default regression suite submits no tasks.
 
 ### Historical OPSD fixed-split validation (3 seeds)
 

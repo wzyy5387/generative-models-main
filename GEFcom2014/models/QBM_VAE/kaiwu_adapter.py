@@ -258,11 +258,6 @@ class KaiwuClient:
 
     def __init__(self, project_no=None, wait=True, interval=1):
         self.project_no = project_no or os.environ.get("KAIWU_PROJECT_NO")
-        if not self.project_no:
-            raise RuntimeError(
-                "Kaiwu project_no is required at runtime. Pass it explicitly or "
-                "set KAIWU_PROJECT_NO; do not commit it to the repository."
-            )
         self.wait = bool(wait)
         self.interval = int(interval)
         self._kaiwu, self._optimizer_cls, self._task_mode = load_kaiwu_sdk()

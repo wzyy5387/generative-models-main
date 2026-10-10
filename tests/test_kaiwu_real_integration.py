@@ -2,7 +2,7 @@
 
 """Opt-in real Kaiwu/SPQC integration tests for the FA-BM-VAE adapter.
 
-These tests are skipped unless FA_BM_VAE_RUN_REAL_KAIWU=1. They are never
+These tests are skipped unless both real-Kaiwu test gates are enabled. They are never
 part of the default regression suite because they submit paid/platform tasks.
 """
 
@@ -32,16 +32,14 @@ from GEFcom2014.models.QBM_VAE.submit_kaiwu_sampling import submit_one
 
 
 pytestmark = pytest.mark.skipif(
-    os.environ.get("FA_BM_VAE_RUN_REAL_KAIWU") != "1",
-    reason="Set FA_BM_VAE_RUN_REAL_KAIWU=1 to submit real Kaiwu tasks",
+    os.environ.get("FA_BM_VAE_RUN_REAL_KAIWU") != "1"
+    or os.environ.get("FA_BM_VAE_RUN_REAL_KAIWU_TESTS") != "1",
+    reason="Set both real-Kaiwu flags to run paid integration tests",
 )
 
 
 def _project_no():
-    value = os.environ.get("KAIWU_PROJECT_NO")
-    if not value:
-        pytest.skip("KAIWU_PROJECT_NO is not configured")
-    return value
+    return os.environ.get("KAIWU_PROJECT_NO")
 
 
 def _submit_matrix(tmp_path, matrix, instance_id, gain=None):

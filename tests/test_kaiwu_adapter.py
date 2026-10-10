@@ -90,7 +90,8 @@ def test_quantization_rejects_overflow_instead_of_clipping():
         quantize_hardware_matrix(h, np.zeros((48, 48)), hardware_gain=1000.0)
 
 
-def test_kaiwu_client_uses_sampling_mode_without_importing_the_sdk():
+@pytest.mark.parametrize("project_no", [None, "runtime-only-project"])
+def test_kaiwu_client_uses_sampling_mode_without_importing_the_sdk(monkeypatch, project_no):
     calls = {}
 
     class FakeTaskMode:
@@ -105,12 +106,12 @@ def test_kaiwu_client_uses_sampling_mode_without_importing_the_sdk():
             calls["sort_solutions"] = sort_solutions
             return np.ones((10, matrix.shape[0]), dtype=np.int8)
 
-    client = KaiwuClient.__new__(KaiwuClient)
-    client.project_no = "runtime-only-project"
-    client.wait = True
-    client.interval = 1
-    client._optimizer_cls = FakeOptimizer
-    client._task_mode = FakeTaskMode
+    monkeypatch.delenv("KAIWU_PROJECT_NO", raising=False)
+    monkeypatch.setattr(
+        "GEFcom2014.models.QBM_VAE.kaiwu_adapter.load_kaiwu_sdk",
+        lambda: (SimpleNamespace(), FakeOptimizer, FakeTaskMode),
+    )
+    client = KaiwuClient(project_no=project_no)
     result = client.sample_hardware_matrix(
         np.zeros((49, 49), dtype=np.int8),
         num_reads=10,
@@ -120,6 +121,7 @@ def test_kaiwu_client_uses_sampling_mode_without_importing_the_sdk():
     assert calls["task_mode"] == "sampling"
     assert calls["sample_number"] == 10
     assert calls["task_name"] == "unique-test-task"
+    assert calls["project_no"] == project_no
     assert calls["negtail_flip"] is False
     assert calls["sort_solutions"] is False
 
