@@ -290,7 +290,7 @@ def test_submission_bundle_is_hash_locked_and_deterministic(tmp_path):
     assert submission["platform_limits_checked"]["int8_coefficient_range"] == [-128, 127]
     assert submission["platform_limits_checked"]["int8_range_verified"] is True
     assert submission["platform_limits_checked"]["machine_profile"] == {
-        "name": "CPQC-550", "max_variables": 550,
+        "name": "SPQC-550", "max_variables": 550,
         "full_connectivity": True, "coupling_precision": "int8"
     }
     assert submission["sdk_versions"]["importlib_metadata_version"]

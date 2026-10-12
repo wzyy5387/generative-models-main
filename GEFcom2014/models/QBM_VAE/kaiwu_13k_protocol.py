@@ -67,9 +67,9 @@ def validate_protocol(protocol):
     if limits.get("int8_range_verified") is not True:
         raise ValueError("Protocol int8 coefficient range must be verified")
     profile = limits.get("machine_profile", {})
-    if profile != {"name": "CPQC-550", "max_variables": 550,
+    if profile != {"name": "SPQC-550", "max_variables": 550,
                    "full_connectivity": True, "coupling_precision": "int8"}:
-        raise ValueError("Protocol must declare the CPQC-550 machine profile")
+        raise ValueError("Protocol must declare the SPQC-550 machine profile")
 
 
 def load_manifest(path):
@@ -421,13 +421,14 @@ def readiness_report(protocol, budget, vs_paths, test_path, output_path, missing
         "## Platform gate",
         "",
         "- `hardware_claim=false` and `physical_platform_used=false` for all offline artifacts.",
-        "- CPQC-550 is recorded as 550 variables/full-connectivity/int8; edge counts are audit fields, not a guessed platform cap.",
-        "- Missing platform conditions: verified Sampling Credits, licensed SDK/account environment, and real response files." if missing_platform else "- Platform conditions supplied.",
+        "- SPQC-550 is recorded as 550 variables/full-connectivity/int8; this metadata does not select or verify the physical machine.",
+        "- The account UI showed 15,000 Sampling Credits; this offline audit cannot verify the balance, SDK license, or SPQC-550 task routing." if missing_platform else "- Platform conditions supplied.",
+        "- Confirm the SDK task routes to SPQC-550 before the first paid submission; verify the actual platform/task metadata in the returned response.",
         "- Real TEST submission is blocked until one gain is frozen from VS only.",
         "",
         "## Manual-gated next command",
         "",
-        "The code and documentation are ready for a single-task canary, but run only after Sampling Credits and a licensed account environment are verified; project_no is optional for standard SPQC-550 tasks. This command was not executed:",
+        "The code and documentation are ready for a single-task canary, but run only after the SDK license, account credits and SPQC-550 routing are confirmed; project_no is optional for standard SPQC-550 tasks. This command was not executed:",
         "",
         "```powershell",
         "$env:FA_BM_VAE_RUN_REAL_KAIWU=\"1\"",
@@ -446,7 +447,7 @@ def readiness_report(protocol, budget, vs_paths, test_path, output_path, missing
         "- Decision value: exploratory normalized cost-loss only; no real market prices; excluded from main empirical evidence.",
         "- Repository manuscript search: no .tex/.docx/manuscript*.md/paper*.md file found; paper wording must be updated outside this repository if applicable.",
         "",
-        "Final status: `BLOCKED` (Sampling Credits and licensed SDK/account environment not yet verified; no physical response files).",
+        "Final status: `BLOCKED` (offline audit cannot verify SDK license, account balance or SPQC-550 routing; no physical response files).",
     ]
     output_path = Path(output_path)
     output_path.parent.mkdir(parents=True, exist_ok=True)

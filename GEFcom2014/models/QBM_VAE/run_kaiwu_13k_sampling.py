@@ -112,7 +112,7 @@ def _validated_records_for_tasks(tasks, records):
 
 
 def _validate_execution_limits(tasks):
-    """Validate every frozen matrix; CPQC-550 has no guessed edge cap."""
+    """Validate every frozen matrix; SPQC-550 has no guessed edge cap."""
     checked = set()
     for item in tasks:
         key = str(item["manifest"])
@@ -125,10 +125,10 @@ def _validate_execution_limits(tasks):
             raise RuntimeError("Real execution requires verified int8 coefficient range")
         if limits.get("int8_range_verified") is not True:
             raise RuntimeError("Real execution requires verified int8 coefficient range")
-        if limits.get("machine_profile") != {"name": "CPQC-550", "max_variables": 550,
+        if limits.get("machine_profile") != {"name": "SPQC-550", "max_variables": 550,
                                               "full_connectivity": True,
                                               "coupling_precision": "int8"}:
-            raise RuntimeError("Real execution requires the CPQC-550 machine profile")
+            raise RuntimeError("Real execution requires the SPQC-550 machine profile")
         for instance in payload.get("instances", []):
             if instance.get("clipping") is True or instance.get("quantization_audit", {}).get("clipping") is True:
                 raise RuntimeError("Real execution refuses a clipped matrix")
@@ -277,10 +277,10 @@ def _build_test_manifest(preparation, selected_gain, protocol_id):
                 "frozen": True, "hardware_gain": float(selected_gain),
                 "requested_reads_per_instance": 100, "n_instances": len(records),
                 "source_manifest_sha256": sha256_file(source),
-                "machine_profile": {"name": "CPQC-550", "max_variables": 550,
+                "machine_profile": {"name": "SPQC-550", "max_variables": 550,
                                     "full_connectivity": True, "coupling_precision": "int8"},
                 "platform_limits_checked": {"int8_coefficient_range": [-128, 127],
-                    "int8_range_verified": True, "machine_profile": {"name": "CPQC-550", "max_variables": 550,
+                    "int8_range_verified": True, "machine_profile": {"name": "SPQC-550", "max_variables": 550,
                     "full_connectivity": True, "coupling_precision": "int8"}},
                 "instances": records}
     _atomic_json(manifest_path, manifest)

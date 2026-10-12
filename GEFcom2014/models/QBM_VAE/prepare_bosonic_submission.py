@@ -134,7 +134,7 @@ def enforce_limits(stats, max_bits=None, max_edges=None, coefficient_limit=None)
             "Problem has %d bits, above platform limit %d"
             % (stats["n_bits"], max_bits)
         )
-    # CPQC-550 is specified by binary-variable capacity and connectivity, not
+    # SPQC-550 is specified by binary-variable capacity and connectivity, not
     # by a user-supplied edge cap.  Edge counts remain audit fields only.
     if (
         coefficient_limit is not None
@@ -296,7 +296,7 @@ def prepare_submission(
             "int8_range_verified": True,
             "int8_range_source": "local kaiwu_adapter validation",
             "machine_profile": {
-                "name": "CPQC-550",
+                "name": "SPQC-550",
                 "max_variables": 550,
                 "full_connectivity": True,
                 "coupling_precision": "int8",

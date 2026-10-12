@@ -69,17 +69,22 @@ def test_spqc550_without_project_no_reaches_mocked_submit(tmp_path, monkeypatch)
     assert list((tmp_path / "checkpoints").glob("*.intent.json"))
 
 
-def test_real_execution_checks_cpqc550_profile(tmp_path):
+def test_real_execution_checks_spqc550_profile(tmp_path):
     manifest = tmp_path / "submission_manifest.json"
     manifest.write_text(json.dumps({
         "platform_limits_checked": {
             "int8_coefficient_range": [-128, 127],
             "int8_range_verified": True,
-            "machine_profile": {"name": "CPQC-550", "max_variables": 550,
+            "machine_profile": {"name": "SPQC-550", "max_variables": 550,
                                 "full_connectivity": True, "coupling_precision": "int8"},
         }
     }), encoding="utf-8")
     _validate_execution_limits([{"manifest": manifest}])
+    payload = json.loads(manifest.read_text(encoding="utf-8"))
+    payload["platform_limits_checked"]["machine_profile"]["name"] = "CPQC-550"
+    manifest.write_text(json.dumps(payload), encoding="utf-8")
+    with pytest.raises(RuntimeError, match="SPQC-550"):
+        _validate_execution_limits([{"manifest": manifest}])
 
 
 def test_resume_recognizes_completed_matrix_without_repeating_charge(tmp_path):

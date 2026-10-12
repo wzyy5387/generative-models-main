@@ -33,7 +33,7 @@
       "int8_range_verified": true,
       "int8_range_source": "local kaiwu_adapter validation",
       "machine_profile": {
-        "name": "CPQC-550",
+        "name": "SPQC-550",
         "max_variables": 550,
         "full_connectivity": true,
         "coupling_precision": "int8"

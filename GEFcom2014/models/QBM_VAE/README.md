@@ -243,9 +243,10 @@ The authoritative current plan is
 `configs/paper/fa_bm_vae_kaiwu_13k_protocol.json`. Training is classical:
 the frozen FA-BM-VAE replaces only the conditional Ising latent sampler on the
 platform. There are currently no physical-platform results. The current
-hardware profile is CPQC-550 (550-variable capacity, full connectivity, int8
-contract); this is a package constraint record, not evidence that a task has
-run.
+hardware profile is SPQC-550 (550-variable capacity, full connectivity, int8
+contract); this is a package constraint record, not an SDK machine selector or
+evidence that a task has run. Confirm the account's SPQC-550 task routing before
+the first paid submission.
 
 The current budget is fixed as follows:
 
