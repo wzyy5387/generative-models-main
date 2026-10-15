@@ -31,13 +31,40 @@ def _sha256(path):
     return hashlib.sha256(Path(path).read_bytes()).hexdigest()
 
 
-def _vs_tasks(preparation):
+def _validate_preparation_identity(preparation, protocol):
+    """Reject a preparation directory built for another protocol/model/data bundle."""
+    manifest_path = Path(preparation) / "preparation_manifest.json"
+    if not manifest_path.is_file():
+        return
+    payload = json.loads(manifest_path.read_text(encoding="utf-8"))
+    protocol_path = resolve_repo_path(protocol.get("_path", "")) if protocol.get("_path") else None
+    if protocol_path is not None and protocol_path.is_file():
+        expected_protocol_hash = sha256_file(protocol_path)
+        if payload.get("protocol_sha256") != expected_protocol_hash:
+            raise RuntimeError("Preparation directory was built from a different protocol JSON")
+    expected_model_hash = protocol.get("model", {}).get("checkpoint")
+    freeze_path = Path(preparation) / "frozen_model_audit.json"
+    if expected_model_hash and freeze_path.is_file():
+        freeze = json.loads(freeze_path.read_text(encoding="utf-8"))
+        actual = freeze.get("files", {}).get("checkpoint", {}).get("path")
+        if actual and Path(actual).name != Path(expected_model_hash).name:
+            raise RuntimeError("Preparation directory model checkpoint does not match protocol")
+
+
+def _vs_tasks(preparation, protocol=None):
     tasks = []
-    for gain in (125, 150, 200):
+    gains = (protocol or {}).get("hardware", {}).get("candidate_gains", [125, 150, 200])
+    expected_instances = int((protocol or {}).get("vs", {}).get("instances", 10))
+    for gain in gains:
         manifest_path = preparation / ("submission_gain_%d" % gain) / "package" / "submission_manifest.json"
         if not manifest_path.is_file():
             raise FileNotFoundError("Missing frozen VS submission manifest: %s" % manifest_path)
         payload = json.loads(manifest_path.read_text(encoding="utf-8"))
+        if payload.get("split") != "VS" or int(payload.get("n_instances", -1)) != expected_instances:
+            raise ValueError("VS submission manifest does not match the protocol")
+        expected_reads = int((protocol or {}).get("hardware", {}).get("reads_per_instance", 100))
+        if int(payload.get("requested_reads_per_instance", -1)) != expected_reads:
+            raise ValueError("VS submission manifest reads do not match the protocol")
         for item in payload.get("instances", []):
             matrix = manifest_path.parent / item["hardware_matrix"]
             tasks.append({"gain": gain, "manifest": manifest_path, "stage": "vs",
@@ -45,8 +72,8 @@ def _vs_tasks(preparation):
                           "instance_id": item["instance_id"],
                           "matrix": matrix, "matrix_sha256": item["hardware_matrix_sha256"],
                           "reads": int(payload["requested_reads_per_instance"])})
-    if len(tasks) != 30:
-        raise ValueError("Frozen VS plan must contain exactly 30 tasks")
+        if len([item for item in tasks if item["gain"] == gain]) != expected_instances:
+            raise ValueError("Frozen VS plan has the wrong instance count for gain %s" % gain)
     return tasks
 
 
@@ -219,7 +246,7 @@ def _test_source_manifest(preparation):
     return matches[0]
 
 
-def _build_test_manifest(preparation, selected_gain, protocol_id):
+def _build_test_manifest(preparation, selected_gain, protocol_id, protocol=None):
     source = _test_source_manifest(preparation)
     out = Path(preparation) / ("submission_test_gain_%d" % int(selected_gain)) / "package"
     manifest_path = out / "submission_manifest.json"
@@ -232,6 +259,10 @@ def _build_test_manifest(preparation, selected_gain, protocol_id):
     out.joinpath("payloads").mkdir(parents=True, exist_ok=True)
     out.joinpath("hardware_matrices").mkdir(parents=True, exist_ok=True)
     records = []
+    expected_reads = int((protocol or {}).get("hardware", {}).get("reads_per_instance", 100))
+    expected_instances = int((protocol or {}).get("test", {}).get("instances", 100))
+    if len(source_items) != expected_instances:
+        raise RuntimeError("Frozen TEST manifest has %d instances; protocol requires %d" % (len(source_items), expected_instances))
     for item in source_items:
         payload_path = resolve_repo_path(item["platform_payload"])
         payload = json.loads(payload_path.read_text(encoding="utf-8"))
@@ -275,7 +306,7 @@ def _build_test_manifest(preparation, selected_gain, protocol_id):
     manifest = {"schema_version": 1, "stage": "test-evaluation", "split": "TEST",
                 "hardware_claim": False, "physical_platform_used": False,
                 "frozen": True, "hardware_gain": float(selected_gain),
-                "requested_reads_per_instance": 100, "n_instances": len(records),
+                "requested_reads_per_instance": expected_reads, "n_instances": len(records),
                 "source_manifest_sha256": sha256_file(source),
                 "machine_profile": {"name": "SPQC-550", "max_variables": 550,
                                     "full_connectivity": True, "coupling_precision": "int8"},
@@ -289,10 +320,11 @@ def _build_test_manifest(preparation, selected_gain, protocol_id):
 
 def planned_tasks(stage, preparation, output_dir, protocol=None):
     if stage == "vs":
-        return _vs_tasks(preparation)
+        return _vs_tasks(preparation, protocol)
     freeze = _load_frozen_gain(preparation)
     manifest_path = _build_test_manifest(preparation, float(freeze["selected_gain"]),
-                                         (protocol or {}).get("protocol_version", "fa-bm-vae-kaiwu-13k-v1"))
+                                         (protocol or {}).get("protocol_version", "fa-bm-vae-kaiwu-13k-v1"),
+                                         protocol)
     payload = json.loads(manifest_path.read_text(encoding="utf-8"))
     return [{"gain": float(payload["hardware_gain"]), "manifest": manifest_path,
              "stage": "test", "task_name": (json.loads((manifest_path.parent / item["payload"]).read_text(encoding="utf-8")).get("task_name") if item.get("payload") else None),
@@ -304,7 +336,9 @@ def planned_tasks(stage, preparation, output_dir, protocol=None):
 
 def run(args):
     protocol = load_protocol(args.protocol)
+    protocol["_path"] = str(Path(args.protocol).resolve())
     preparation = Path(args.preparation).resolve()
+    _validate_preparation_identity(preparation, protocol)
     output_dir = Path(args.output_dir).resolve()
     checkpoint_dir = Path(args.checkpoint_dir).resolve()
     all_tasks = planned_tasks(args.stage, preparation, output_dir, protocol)
@@ -351,6 +385,7 @@ def run(args):
     if not tasks:
         validated = _validated_records_for_tasks(all_tasks, audit_records)
         complete = bool(all_tasks) and len(validated) == len(all_tasks)
+        pending_count = len(all_tasks) - len(validated)
         if recovered_records:
             _atomic_json(audit_path, {"stage": args.stage, "records": validated,
                 "completed": len(validated), "skipped_validated": len(completed),
@@ -358,8 +393,8 @@ def run(args):
                 "requested_reads": sum(item["reads"] for item in all_tasks),
                 "returned_reads": sum(int(r["returned_reads"]) for r in validated),
                 "hardware_claim": complete, "physical_platform_used": complete})
-        return {"stage": args.stage, "completed": len(completed),
-                "skipped_validated": len(completed), "pending": 0,
+        return {"stage": args.stage, "completed": len(validated),
+                "skipped_validated": len(completed), "pending": pending_count,
                 "requested_reads": sum(item["reads"] for item in all_tasks),
                 "returned_reads": sum(int(r["returned_reads"]) for r in validated), "hardware_claim": complete,
                 "physical_platform_used": complete}

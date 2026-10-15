@@ -107,13 +107,23 @@ def main():
     split_to_raw = {"VS": data[2], "TEST": data[4]}
     all_conditions = split_to_x[args.split]
     raw_frame = split_to_raw[args.split]
-    selected_rows = select_instance_rows(
-        args.tag,
-        raw_frame.values,
-        args.num_instances,
-        args.selection,
-        args.selection_seed,
-    )
+    if args.indices_file is not None:
+        selected_rows = np.asarray(
+            json.loads(Path(args.indices_file).read_text(encoding="utf-8")),
+            dtype=np.int64,
+        )
+        if selected_rows.ndim != 1 or selected_rows.size == 0:
+            raise ValueError("--indices-file must contain a non-empty list of row indices")
+        if np.any(selected_rows < 0) or np.any(selected_rows >= len(raw_frame)):
+            raise ValueError("--indices-file contains an out-of-range row index")
+    else:
+        selected_rows = select_instance_rows(
+            args.tag,
+            raw_frame.values,
+            args.num_instances,
+            args.selection,
+            args.selection_seed,
+        )
     instances = []
     for export_index, source_row in enumerate(selected_rows):
         x_cond = all_conditions[source_row]
@@ -263,6 +273,7 @@ def main():
             "export_index": export_index,
             "selection": args.selection,
             "selection_seed": args.selection_seed,
+            "selection_indices": [int(value) for value in selected_rows.tolist()],
             "zone": infer_zone(args.tag, raw_frame.values[source_row]),
             "date": str(raw_frame.index[source_row]),
             "representation": representation,
@@ -370,6 +381,12 @@ def append_anchor_conditions(
     if not bool(getattr(model, "decoder_anchor", False)):
         return x_scaled
     anchor_source = config.get("anchor_source")
+    # The old fixed-window OPSD checkpoint predates the explicit
+    # ``anchor_source`` field. Its cond_in=57 and decoder_anchor=True match the
+    # historical context-anchor path (33 scaled context features + 24 forecast
+    # values). Keep that artifact loadable without rewriting its JSON.
+    if anchor_source is None and bool(config.get("decoder_anchor", False)):
+        anchor_source = "context"
     target_size = int(model.in_size)
     if anchor_source == "context":
         if raw_x.shape[1] < target_size:
@@ -416,7 +433,10 @@ def load_track(tag, dataset_bundle=None):
         import pandas as pd
 
         data = tuple(
-            pd.DataFrame(arrays["%s_%s" % (kind, split)])
+            pd.DataFrame(
+                arrays["%s_%s" % (kind, split)],
+                index=pd.to_datetime(dates[split]),
+            )
             for split in ("ls", "vs", "test")
             for kind in ("x", "y")
         )
@@ -527,6 +547,12 @@ def parse_args():
         default="head",
     )
     parser.add_argument("--selection-seed", type=int, default=2026)
+    parser.add_argument(
+        "--indices-file",
+        type=Path,
+        default=None,
+        help="Optional JSON list of frozen source-row indices; avoids reselecting conditions.",
+    )
     parser.add_argument("--beta", type=float, default=1.0)
     parser.add_argument(
         "--hardware-gain",

@@ -94,6 +94,25 @@ def test_real_vs_selection_requires_verified_platform_metadata(tmp_path):
     assert selected["test_peeking"] is False
 
 
+def test_vs_gain_selection_aggregates_fixed_panel_and_breaks_exact_ties_by_gain(tmp_path):
+    records = []
+    for gain in (125, 150, 200):
+        for instance in range(2):
+            records.append({
+                "gain": gain, "instance_id": "vs_%d" % instance,
+                "hardware_claim": True, "physical_platform_used": True,
+                "energy_wasserstein": 0.1, "effective_beta_error": 0.01,
+                "edge_moment_mae": 0.02, "magnetization_mae": 0.02,
+                "unique_state_fraction": 0.9,
+            })
+    selected = select_vs_gain(
+        records, tmp_path / "frozen.json", required_gains=(125, 150, 200),
+        expected_instances_per_gain=2,
+    )
+    assert selected["selected_gain"] == 125.0
+    assert len(selected["candidate_metrics"]) == 3
+
+
 def test_read_convergence_and_test_metrics_keep_reads_within_instance():
     h = np.array([0.2, -0.1])
     j = np.array([[0.0, 0.1], [0.1, 0.0]])

@@ -24,6 +24,7 @@ from GEFcom2014.models.QBM_VAE import (
     temporal_mi_sparse_graph,
 )
 from GEFcom2014.models.QBM_VAE.forecast_anchor import (
+    DeterministicForecastAnchor,
     fit_deterministic_anchor,
     predict_deterministic_anchor,
 )
@@ -73,6 +74,32 @@ def parse_args():
         ),
     )
     parser.add_argument(
+        "--context-anchor-conditioning-only",
+        action="store_true",
+        help=(
+            "Append the same fixed context anchor to the condition vector, but "
+            "do not add it to the decoder output. This is the matched no-anchor-"
+            "addition ablation."
+        ),
+    )
+    decoder_init_group = parser.add_mutually_exclusive_group()
+    decoder_init_group.add_argument(
+        "--decoder-mean-zero-init",
+        dest="decoder_mean_zero_init",
+        action="store_true",
+        default=None,
+        help=(
+            "Zero-initialize the decoder mean head independently of whether "
+            "the context anchor is added to the mean."
+        ),
+    )
+    decoder_init_group.add_argument(
+        "--no-decoder-mean-zero-init",
+        dest="decoder_mean_zero_init",
+        action="store_false",
+        help="Disable decoder mean-head zero initialization explicitly.",
+    )
+    parser.add_argument(
         "--learned-forecast-anchor",
         action="store_true",
         help="Fit an LS/VS-selected deterministic MLP and learn QBM residuals around it.",
@@ -82,6 +109,12 @@ def parse_args():
     parser.add_argument("--anchor-epochs", type=int, default=100)
     parser.add_argument("--anchor-learning-rate", type=float, default=1e-3)
     parser.add_argument("--anchor-patience", type=int, default=15)
+    parser.add_argument(
+        "--frozen-anchor-model",
+        type=Path,
+        default=None,
+        help="Load an existing validation-selected MLP anchor instead of refitting it.",
+    )
     parser.add_argument("--learning-rate", type=float, default=3e-4)
     parser.add_argument("--weight-decay", type=float, default=1e-5)
     parser.add_argument("--batch-size", type=int, default=256)
@@ -167,6 +200,11 @@ def parse_args():
     parser.add_argument("--cpu", action="store_true")
     parser.add_argument("--skip-plots", action="store_true")
     parser.add_argument("--skip-scenarios", action="store_true", help="Train and save the model without sampling scenarios.")
+    parser.add_argument(
+        "--validation-only",
+        action="store_true",
+        help="Generate VS scenarios only; legacy default still generates VS and TEST.",
+    )
     if config_args.config is not None:
         with config_args.config.open("r", encoding="utf-8") as handle:
             defaults = json.load(handle)
@@ -178,6 +216,16 @@ def parse_args():
             "hardware_sampling_stage",
             "hardware_sampling_substitution",
             "quantum_advantage_claim",
+            "protocol_version",
+            "artifact_role",
+            "checkpoint_selection",
+            "test_used_for_selection",
+            "couplings_fixed_zero",
+            "conditioning_invariant",
+            "initialization_invariant",
+            "historical_graph_json_note",
+            "training_seed_policy",
+            "generation_seed_policy",
         }
         unknown = sorted(set(defaults) - valid_destinations - metadata_only)
         if unknown:
@@ -191,7 +239,11 @@ def parse_args():
                 if key in valid_destinations
             }
         )
-    return parser.parse_args()
+    args = parser.parse_args()
+    if args.validation_only:
+        args.scenario_splits = ["VS"]
+        args.skip_plots = True
+    return args
 
 
 def _random_graph_like(reference_mask, random_graph_density=None, seed=0):
@@ -366,8 +418,12 @@ if __name__ == "__main__":
             "Transverse-field training currently requires the internal "
             "path-integral negative phase"
         )
-    if args.forecast_anchor and args.learned_forecast_anchor:
-        raise ValueError("Choose only one of --forecast-anchor and --learned-forecast-anchor")
+    if args.forecast_anchor and (args.learned_forecast_anchor or args.frozen_anchor_model):
+        raise ValueError("Choose only one forecast anchor mode")
+    if args.context_anchor_conditioning_only and (
+        args.forecast_anchor or args.learned_forecast_anchor or args.frozen_anchor_model
+    ):
+        raise ValueError("--context-anchor-conditioning-only cannot be combined with an anchor-addition mode")
     if args.graph_mask_model and args.graph_mask_file:
         raise ValueError("Choose only one of --graph-mask-model and --graph-mask-file")
     if len(set(args.scenario_splits)) != len(args.scenario_splits):
@@ -448,7 +504,7 @@ if __name__ == "__main__":
 
     anchor_model = None
     anchor_history = []
-    if args.forecast_anchor:
+    if args.forecast_anchor or args.context_anchor_conditioning_only:
         target_size = y_LS_scaled.shape[1]
         if df_x_LS.shape[1] < target_size:
             raise ValueError(
@@ -462,25 +518,49 @@ if __name__ == "__main__":
         x_LS_scaled = np.concatenate((x_LS_scaled, anchor_splits[0]), axis=1)
         x_VS_scaled = np.concatenate((x_VS_scaled, anchor_splits[1]), axis=1)
         x_TEST_scaled = np.concatenate((x_TEST_scaled, anchor_splits[2]), axis=1)
-    elif args.learned_forecast_anchor:
+    elif args.learned_forecast_anchor or args.frozen_anchor_model:
         anchor_device = torch.device(
             "cuda:0" if gpu and torch.cuda.is_available() else "cpu"
         )
-        anchor_model, anchor_history = fit_deterministic_anchor(
-            x_LS_scaled,
-            y_LS_scaled,
-            x_VS_scaled,
-            y_VS_scaled,
-            hidden_dim=args.anchor_hidden_dim,
-            layers=args.anchor_layers,
-            epochs=args.anchor_epochs,
-            batch_size=args.batch_size,
-            learning_rate=args.anchor_learning_rate,
-            weight_decay=args.weight_decay,
-            patience=args.anchor_patience,
-            seed=args.seed,
-            device=anchor_device,
-        )
+        if args.frozen_anchor_model:
+            checkpoint = torch.load(
+                args.frozen_anchor_model, map_location=anchor_device
+            )
+            expected_context_dim = int(df_x_LS.shape[1])
+            expected_target_dim = int(y_LS_scaled.shape[1])
+            if checkpoint.get("context_dim") != expected_context_dim:
+                raise ValueError("Frozen anchor context dimension does not match GEFCom Wind")
+            if checkpoint.get("target_dim") != expected_target_dim:
+                raise ValueError("Frozen anchor target dimension does not match GEFCom Wind")
+            anchor_model = DeterministicForecastAnchor(
+                context_dim=expected_context_dim,
+                target_dim=expected_target_dim,
+                hidden_dim=int(checkpoint["hidden_dim"]),
+                layers=int(checkpoint["layers"]),
+            ).to(anchor_device)
+            anchor_model.load_state_dict(checkpoint["state_dict"])
+            anchor_model.eval()
+            anchor_history = [{
+                "source": "frozen_checkpoint",
+                "path": str(args.frozen_anchor_model.resolve()),
+                "sha256": hashlib.sha256(args.frozen_anchor_model.read_bytes()).hexdigest(),
+            }]
+        else:
+            anchor_model, anchor_history = fit_deterministic_anchor(
+                x_LS_scaled,
+                y_LS_scaled,
+                x_VS_scaled,
+                y_VS_scaled,
+                hidden_dim=args.anchor_hidden_dim,
+                layers=args.anchor_layers,
+                epochs=args.anchor_epochs,
+                batch_size=args.batch_size,
+                learning_rate=args.anchor_learning_rate,
+                weight_decay=args.weight_decay,
+                patience=args.anchor_patience,
+                seed=args.seed,
+                device=anchor_device,
+            )
         anchor_splits = (
             predict_deterministic_anchor(anchor_model, x_LS_scaled, anchor_device),
             predict_deterministic_anchor(anchor_model, x_VS_scaled, anchor_device),
@@ -507,16 +587,19 @@ if __name__ == "__main__":
     run_label = args.run_label
     if not run_label and args.forecast_anchor:
         run_label = "anchor"
-    if not run_label and args.learned_forecast_anchor:
+    if not run_label and (args.learned_forecast_anchor or args.frozen_anchor_model):
         run_label = "lanchor"
     model_version = model_family + (("_" + run_label) if run_label else "")
     config = {"name": model_version, "latent_s": args.latent_s, "enc_w": args.enc_w, "enc_l": args.enc_l,
               "dec_w": args.dec_w, "dec_l": args.dec_l, "learning_rate": args.learning_rate,
               "weight_decay": args.weight_decay, "decoder_covariance": args.decoder_covariance,
               "max_ar_coefficient": args.max_ar_coefficient,
-              "decoder_anchor": args.forecast_anchor or args.learned_forecast_anchor,
+              "decoder_anchor": args.forecast_anchor or args.learned_forecast_anchor or args.frozen_anchor_model is not None,
+              "context_anchor_conditioning_only": bool(args.context_anchor_conditioning_only),
               "anchor_source": (
                   "context" if args.forecast_anchor else
+                  "context_conditioning_only" if args.context_anchor_conditioning_only else
+                  "frozen_mlp" if args.frozen_anchor_model else
                   "learned_mlp" if args.learned_forecast_anchor else "none"
               ),
               "anchor_hidden_dim": args.anchor_hidden_dim,
@@ -525,6 +608,18 @@ if __name__ == "__main__":
               "anchor_learning_rate": args.anchor_learning_rate,
               "anchor_patience": args.anchor_patience,
               "anchor_history": anchor_history}
+    config["decoder_mean_zero_init"] = (
+        bool(config["decoder_anchor"])
+        if args.decoder_mean_zero_init is None
+        else bool(args.decoder_mean_zero_init)
+    )
+    config["frozen_anchor_model"] = (
+        str(args.frozen_anchor_model.resolve()) if args.frozen_anchor_model else None
+    )
+    config["frozen_anchor_model_sha256"] = (
+        hashlib.sha256(args.frozen_anchor_model.read_bytes()).hexdigest()
+        if args.frozen_anchor_model else None
+    )
 
     config["in_size"] = y_LS_scaled.shape[1]
     config["cond_in"] = x_LS_scaled.shape[1]
@@ -585,6 +680,8 @@ if __name__ == "__main__":
     config["graph_max_lag"] = args.graph_max_lag
     config["random_graph_density"] = args.random_graph_density
     config["scenario_splits"] = list(args.scenario_splits)
+    config["validation_only"] = bool(args.validation_only)
+    config["generation_sampler_seed"] = int(args.seed)
     config["zone_embedding_dim"] = args.zone_embedding_dim
     config["nb_zones"] = args.nb_zones
     config["dataset_bundle"] = str(args.dataset_bundle.resolve()) if args.dataset_bundle else None
@@ -612,9 +709,9 @@ if __name__ == "__main__":
             top_k=config["top_k"],
             random_graph_density=config["random_graph_density"],
             seed=config["graph_seed"],
-            residual_train=(
+                residual_train=(
                 y_LS_scaled - anchor_splits[0]
-                if args.forecast_anchor or args.learned_forecast_anchor
+                if args.forecast_anchor or args.context_anchor_conditioning_only or args.learned_forecast_anchor or args.frozen_anchor_model
                 else None
             ),
             graph_bootstrap_repetitions=config["graph_bootstrap_repetitions"],
@@ -705,8 +802,11 @@ if __name__ == "__main__":
         decoder_covariance=config["decoder_covariance"],
         max_ar_coefficient=config["max_ar_coefficient"],
         decoder_anchor=config["decoder_anchor"],
+        decoder_mean_zero_init=config["decoder_mean_zero_init"],
         gpu=gpu,
     )
+    if config["graph_edges"] == 0:
+        config["couplings_fixed_zero"] = not model.raw_j.requires_grad
     opt = torch.optim.Adam(model.parameters(), lr=config["learning_rate"], weight_decay=config["weight_decay"])
 
     print(
@@ -742,6 +842,12 @@ if __name__ == "__main__":
         trajectory_variogram_weight=config["trajectory_variogram_weight"],
         trajectory_ramp_weight=config["trajectory_ramp_weight"],
     )
+    config["best_epoch"] = int(getattr(best_model, "selection_epoch", -1))
+    config["checkpoint_selection_metric"] = getattr(
+        best_model, "selection_metric", "VS reconstruction"
+    )
+    with open(dir_path + name + ".json", "w") as file:
+        json.dump(config, file, cls=NumpyEncoder)
     print("Training time %.2f s" % (timer() - start))
 
     dump_file(dir=dir_path, name="loss_" + name, file=loss)

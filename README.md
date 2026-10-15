@@ -777,28 +777,24 @@ This repository treats the following as completion gates for an energy
 forecasting submission.  They are protocol requirements, not claims that the
 corresponding experiments have already been completed.
 
-- **OPSD rolling-origin evidence:** `configs/paper/opsd_rolling_origins.json`
-  fixes three expanding LS/VS/TEST origins, four models, 100 scenarios and
-  seeds 0--4.  The runner reports per-origin/per-seed raw CRPS, Energy,
-  Variogram, ramp CRPS, coverage and MAQCE, with date-block bootstrap,
-  paired tests and effect sizes.  The frozen formal result is complete at
-  `export/opsd_rolling_origins_formal_v1`: 60/60 tasks, 5 seeds, 5,400 raw
-  date rows, `artifact_role=formal_complete`, and `eligible_for_paper=true`.
-  The independent statistical outputs are written to
-  `export/opsd_rolling_origins_formal_v1_analysis`; Raw remains the primary
-  result and Cal/Temporal-ECC are sensitivities only. The current Cal/ECC
-  artifacts are VS-only; TEST-side Cal/ECC sensitivity evaluation is not yet
-  complete.
-- **Core seed coverage:** the current primary comparison is FA-BM-VAE,
-  Forecast-anchored Gaussian, GMM-4, Score-SDE, D3U and Treeffuser.  The
-  GEFCom Wind comparison now has paired VS/TEST artifacts for seeds 0--4 for
-  all six families.  The strict Raw audit and five-seed aggregation are under
-  `export/wind_five_seed_comparison`; the separate Cal/Temporal-ECC
-  sensitivity artifacts are under its `cal_ecc_sensitivity` subdirectory.
-  The tracked provenance inventory is `docs/FA_BM_VAE_PROVENANCE.md`.
-  The older FA-BM-VAE seed 0--2 JSON files do not record the negative-phase
-  backend, and none of the five historical artifacts independently records
-  TEST-selection status. These fields remain `NOT_RECORDED`, not `false`.
+- **Current main-table protocol:** the fixed-window OPSD SA-negative
+  comparison uses seeds 0--2, 100 scenarios per TEST date and six matched
+  families: FA-BM-VAE, Forecast-anchored Gaussian, GMM-4, Score-SDE, the
+  fixed-`J=0` ablation, and the no-anchor-addition ablation with the same
+  zero-initialized residual mean head.  The older no-anchor artifact is
+  retained only as an initialization-confounded historical record. Raw metrics are
+  primary; Cal and Cal+ECC are retained as matched sensitivity analyses.  The
+  strict three-seed aggregation, date-block inference and Holm-adjusted
+  comparisons are under `export/opsd_sa_negative_matched_v1/main_table_seed012`.
+  This historical main-table candidate has `LIMITED_ACCEPTANCE`: model hashes
+  and the SA negative-phase field are directly recorded, whereas the original
+  command and a direct historical TEST-selection field are not recorded.
+- **Supplementary generalization evidence:** the GEFCom Wind five-seed audit
+  (`export/wind_five_seed_comparison`) and OPSD rolling-origin artifacts
+  (`export/opsd_rolling_origins_formal_v1`) remain supplementary evidence.
+  They must not replace the fixed-window three-seed main table or be merged
+  into its paired tests.  Raw remains their primary analysis; any Cal/ECC
+  results are sensitivities only.
 - **Decision value (optional; not a completion gate):** the retained implementation is an exploratory normalized
   asymmetric cost-loss analysis without real market prices. It is excluded
   from the main empirical evidence, contribution claims and conclusions; it
@@ -824,11 +820,13 @@ corresponding experiments have already been completed.
   from all tables, statistical claims, and conclusions. Formal multi-turbine
   spatiotemporal validation is reserved for future work.
 
-The historical fixed-split OPSD Cal/ECC table is retained for provenance only.
-It is not the current rolling-origin primary result, and the historical
-`0.027284` FA-BM-VAE-SA value must not be presented as a general OPSD claim.
+The historical fixed-split OPSD three-seed table is the current manuscript
+main-table candidate, subject to the provenance limitation stated above.  The
+five-seed fixed-window audit and rolling-origin experiment are supplementary
+evidence.  The historical `0.027284` FA-BM-VAE-SA value must not be presented
+as a general OPSD claim.
 
-The current formal rolling-origin Raw result is:
+The supplementary rolling-origin Raw result is:
 
 | Model | Mean Raw CRPS |
 |---|---:|

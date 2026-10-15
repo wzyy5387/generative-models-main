@@ -113,6 +113,34 @@ def test_forecast_anchor_initializes_decoder_as_zero_residual_model():
     torch.testing.assert_close(mean, context[:, -2:])
 
 
+def test_no_anchor_addition_can_keep_the_matched_zero_mean_initialization():
+    kwargs = dict(
+        latent_s=4, cond_in=5, in_size=2, enc_w=8, enc_l=1,
+        dec_w=8, dec_l=1, gpu=False, decoder_mean_zero_init=True,
+    )
+    torch.manual_seed(31)
+    anchored = ConditionalQBMVAE(decoder_anchor=True, **kwargs)
+    torch.manual_seed(31)
+    no_addition = ConditionalQBMVAE(decoder_anchor=False, **kwargs)
+
+    for key, value in anchored.state_dict().items():
+        torch.testing.assert_close(value, no_addition.state_dict()[key])
+
+    context = torch.tensor([[3.0, 4.0, 5.0, 0.25, -0.75]])
+    latent = torch.zeros(1, 4)
+    anchored_mean, anchored_scale = anchored.decode_distribution(latent, context)
+    ablated_mean, ablated_scale = no_addition.decode_distribution(latent, context)
+    torch.testing.assert_close(anchored_mean - ablated_mean, context[:, -2:])
+    torch.testing.assert_close(anchored_scale, ablated_scale)
+
+
+def test_decoder_mean_zero_initialization_defaults_to_historical_anchor_behavior():
+    anchored = ConditionalQBMVAE(latent_s=4, cond_in=3, in_size=2, decoder_anchor=True, gpu=False)
+    unanchored = ConditionalQBMVAE(latent_s=4, cond_in=3, in_size=2, decoder_anchor=False, gpu=False)
+    assert anchored.decoder_mean_zero_init is True
+    assert unanchored.decoder_mean_zero_init is False
+
+
 def test_forecast_anchor_rejects_context_smaller_than_target():
     with np.testing.assert_raises(ValueError):
         ConditionalQBMVAE(

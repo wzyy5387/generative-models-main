@@ -53,12 +53,17 @@ def validate_protocol(protocol):
         raise ValueError("Selection seed must be 2026")
     if protocol["dataset"]["test_peeking"] is not False:
         raise ValueError("TEST peeking must be false")
-    if protocol["vs"]["instances"] != 10 or protocol["vs"]["tasks"] != 30:
-        raise ValueError("VS protocol must be 10 instances and 30 tasks")
-    if protocol["test"]["instances"] != 100 or protocol["test"]["tasks"] != 100:
-        raise ValueError("TEST protocol must be 100 instances and 100 tasks")
-    if protocol["budget"]["planned_samples"] != 13000:
-        raise ValueError("Planned sample budget must be 13000")
+    gain_count = len(hardware["candidate_gains"])
+    expected_vs_tasks = int(protocol["vs"]["instances"]) * gain_count
+    expected_test_tasks = int(protocol["test"]["instances"])
+    if int(protocol["vs"]["tasks"]) != expected_vs_tasks:
+        raise ValueError("VS task count must equal instances times candidate gains")
+    if int(protocol["test"]["tasks"]) != expected_test_tasks:
+        raise ValueError("TEST task count must equal TEST instances")
+    reads = int(hardware["reads_per_instance"])
+    expected_planned = (expected_vs_tasks + expected_test_tasks) * reads
+    if int(protocol["budget"]["planned_samples"]) != expected_planned:
+        raise ValueError("Planned sample budget does not match protocol counts")
     if protocol["budget"]["application_upper_limit"] != 15000:
         raise ValueError("Application upper limit must be 15000")
     limits = hardware.get("platform_limits", {})
@@ -91,7 +96,7 @@ def validate_vs_manifests(paths, protocol):
     for path, gain in zip(paths, expected_gains):
         items = load_manifest(path)
         if len(items) != protocol["vs"]["instances"]:
-            raise ValueError("VS manifest %s must contain 10 instances" % path)
+            raise ValueError("VS manifest %s has the wrong instance count" % path)
         ids = []
         for item in items:
             if item.get("split") != "VS" or item.get("selection") != "stratified":
@@ -116,6 +121,7 @@ def validate_vs_manifests(paths, protocol):
 
 def validate_test_manifest(path, protocol):
     items = load_manifest(path)
+    dataset_name = str(protocol.get("dataset", {}).get("name", "")).lower()
     if not items:
         raise ValueError("TEST manifest must contain at least one instance")
     if (len(items) != protocol["test"]["instances"] and
@@ -124,8 +130,8 @@ def validate_test_manifest(path, protocol):
     zones = []
     ids = []
     for item in items:
-        if item.get("split") != "TEST" or item.get("selection") != "stratified":
-            raise ValueError("TEST manifest must be stratified and split=TEST")
+        if item.get("split") != "TEST" or item.get("selection") not in {"stratified", "all"}:
+            raise ValueError("TEST manifest must use selection=stratified or all and split=TEST")
         if int(item.get("selection_seed")) != protocol["dataset"]["selection_seed"]:
             raise ValueError("TEST selection seed mismatch")
         if item.get("hardware_gain") is not None or item.get("hardware_matrix_sha256") is not None:
@@ -135,15 +141,21 @@ def validate_test_manifest(path, protocol):
         if _forbidden_target_keys(item):
             raise ValueError("TEST manifest contains target values")
         zone = item.get("zone")
-        if zone is None:
+        if zone is None and "opsd" not in dataset_name:
             raise ValueError("TEST manifest lacks zone provenance")
-        zones.append(int(zone))
+        if zone is not None:
+            zones.append(int(zone))
         ids.append(str(item["id"]))
     if len(set(ids)) != len(ids):
         raise ValueError("Duplicate TEST instance IDs")
     counts = {zone: zones.count(zone) for zone in range(1, 11)}
-    if len(items) == protocol["test"]["instances"] and counts != {zone: 10 for zone in range(1, 11)}:
-        raise ValueError("Full TEST manifest must contain 10 instances per zone")
+    if len(items) == protocol["test"]["instances"] and "gefcom" in dataset_name:
+        if counts != {zone: 10 for zone in range(1, 11)}:
+            raise ValueError("Full GEFCom TEST manifest must contain 10 instances per zone")
+    if len(items) == protocol["test"]["instances"] and protocol["test"].get("require_unique_dates", False):
+        dates = [str(item.get("date", "")) for item in items]
+        if any(not date for date in dates) or len(set(dates)) != len(dates):
+            raise ValueError("Full TEST manifest must contain unique dates")
     return {"path": str(Path(path).resolve()), "instances": items, "zone_counts": counts}
 
 
@@ -171,11 +183,14 @@ def audit_budget(vs_paths, test_path, protocol):
         "machine_profile": dict(protocol["hardware"]["platform_limits"]["machine_profile"]),
         "sdk_versions": kaiwu_sdk_versions(),
     }
-    if result["vs_tasks"] != 30 or result["vs_samples"] != 3000:
+    expected_vs_tasks = int(protocol["vs"]["instances"]) * len(protocol["hardware"]["candidate_gains"])
+    expected_test_tasks = int(protocol["test"]["instances"])
+    if result["vs_tasks"] != expected_vs_tasks:
         raise ValueError("VS budget mismatch")
-    if result["test_tasks"] != 100 or result["test_samples"] != 10000:
+    if result["test_tasks"] != expected_test_tasks:
         raise ValueError("TEST budget mismatch")
-    if result["planned_samples"] != 13000:
+    expected_planned = (expected_vs_tasks + expected_test_tasks) * reads
+    if result["planned_samples"] != expected_planned:
         raise ValueError("Formal sample budget mismatch")
     if result["planned_samples"] + result["backup_samples_max"] > result["application_upper_limit"]:
         raise ValueError("Backup allowance exceeds application upper limit")
@@ -219,8 +234,13 @@ def compare_read_convergence(h, j, reference, candidate, target_beta=1.0):
     return result
 
 
-def select_vs_gain(response_records, output_path, target_beta=1.0):
-    """Select one gain from verified real VS records and write once."""
+def select_vs_gain(response_records, output_path, target_beta=1.0,
+                   required_gains=None, expected_instances_per_gain=None):
+    """Freeze one gain from verified physical VS records.
+
+    Metrics are averaged within each gain across the fixed VS panel. Ties use
+    the lower gain, so no TEST outcome can alter a deterministic selection.
+    """
     if not response_records:
         raise ValueError("No VS response records supplied")
     for record in response_records:
@@ -232,10 +252,27 @@ def select_vs_gain(response_records, output_path, target_beta=1.0):
                     "magnetization_mae", "unique_state_fraction"):
             if key not in record:
                 raise ValueError("VS response record lacks %s" % key)
-    chosen = min(response_records, key=lambda row: (
-        float(row["energy_wasserstein"]), float(row["effective_beta_error"]),
-        float(row["edge_moment_mae"]), float(row["magnetization_mae"]),
-        -float(row["unique_state_fraction"]),
+    grouped = {}
+    for record in response_records:
+        grouped.setdefault(float(record["gain"]), []).append(record)
+    if required_gains is not None and set(grouped) != {float(gain) for gain in required_gains}:
+        raise ValueError("VS gain selection does not contain exactly the frozen candidate grid")
+    candidate_metrics = []
+    for gain, records in sorted(grouped.items()):
+        if expected_instances_per_gain is not None and len(records) != int(expected_instances_per_gain):
+            raise ValueError("VS gain %s does not have the required number of verified instances" % gain)
+        candidate_metrics.append({
+            "gain": gain,
+            "n_verified_instances": len(records),
+            "energy_wasserstein": float(np.mean([row["energy_wasserstein"] for row in records])),
+            "effective_beta_error": float(np.mean([row["effective_beta_error"] for row in records])),
+            "edge_moment_mae": float(np.mean([row["edge_moment_mae"] for row in records])),
+            "magnetization_mae": float(np.mean([row["magnetization_mae"] for row in records])),
+            "unique_state_fraction": float(np.mean([row["unique_state_fraction"] for row in records])),
+        })
+    chosen = min(candidate_metrics, key=lambda row: (
+        row["energy_wasserstein"], row["effective_beta_error"], row["edge_moment_mae"],
+        row["magnetization_mae"], -row["unique_state_fraction"], row["gain"],
     ))
     output_path = Path(output_path)
     if output_path.exists():
@@ -246,7 +283,9 @@ def select_vs_gain(response_records, output_path, target_beta=1.0):
         "hardware_claim": True,
         "physical_platform_used": True,
         "selected_gain": float(chosen["gain"]),
+        "selection_metric": "lexicographic mean energy Wasserstein, effective-beta error, edge-moment MAE, magnetization MAE, negative unique-state fraction, then lower gain",
         "selection_metrics": chosen,
+        "candidate_metrics": candidate_metrics,
         "immutable": True,
         "test_peeking": False,
         "verified_vs_records": [

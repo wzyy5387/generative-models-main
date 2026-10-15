@@ -117,6 +117,31 @@ def test_limit_is_applied_after_completed_filter():
     assert select_pending_tasks(tasks, {("i0", "h0"), ("i1", "h1")}, 1)[0]["instance_id"] == "i2"
 
 
+def test_zero_limit_does_not_report_unsubmitted_tasks_as_complete(tmp_path, monkeypatch):
+    task = {"stage": "vs", "instance_id": "vs_000", "gain": 125,
+            "matrix_sha256": "frozen-hash", "reads": 100, "matrix": tmp_path / "matrix.npz"}
+    monkeypatch.setattr(
+        "GEFcom2014.models.QBM_VAE.run_kaiwu_13k_sampling.load_protocol",
+        lambda _: {"protocol_version": "test-protocol"},
+    )
+    monkeypatch.setattr(
+        "GEFcom2014.models.QBM_VAE.run_kaiwu_13k_sampling._validate_preparation_identity",
+        lambda *args: None,
+    )
+    monkeypatch.setattr(
+        "GEFcom2014.models.QBM_VAE.run_kaiwu_13k_sampling.planned_tasks",
+        lambda *args: [task],
+    )
+    result = run(SimpleNamespace(
+        stage="vs", protocol=tmp_path / "protocol.json", preparation=tmp_path,
+        output_dir=tmp_path / "responses", checkpoint_dir=tmp_path / "checkpoints",
+        resume=True, limit=0, execute=True, confirm_real_submission=False, project_no=None,
+    ))
+    assert result["completed"] == 0
+    assert result["pending"] == 1
+    assert result["hardware_claim"] is False
+
+
 def test_strict_response_rejects_missing_hash_reads_and_mock(tmp_path):
     response = tmp_path / "r.npz"
     npz_values = {

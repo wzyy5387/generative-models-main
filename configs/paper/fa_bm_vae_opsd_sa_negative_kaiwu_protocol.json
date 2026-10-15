@@ -1,0 +1,53 @@
+{
+  "protocol_version": "fa-bm-vae-opsd-spqc-550-sa-negative-v1",
+  "method_name": "FA-BM-VAE",
+  "dataset": {
+    "name": "OPSD Wind",
+    "source": "GEFcom2014/data/external/opsd_wind_daily.npz",
+    "selection": "ten VS dates stratified by forecast-context quantiles; all 90 TEST dates frozen",
+    "selection_seed": 2026,
+    "test_peeking": false,
+    "test_date_count": 90
+  },
+  "model": {
+    "track": "opsd-wind",
+    "model_name": "opsd-wind_QBMVAE_2_anchor_sa_neg_sa_0",
+    "checkpoint": "export/qbm_vae_opsd-wind/opsd-wind_QBMVAE_2_anchor_sa_neg_sa_0.pickle",
+    "model_config": "export/qbm_vae_opsd-wind/opsd-wind_QBMVAE_2_anchor_sa_neg_sa_0.json",
+    "anchor_source": "context",
+    "anchor_checkpoint": null,
+    "anchor_definition": "first 24 raw forecast-context columns, transformed with the LS-fitted target scaler",
+    "conditioning_order": "33 LS-fitted standardized context columns followed by 24 standardized forecast-anchor columns",
+    "training_backend": "classical",
+    "negative_phase_backend": "sa (directly recorded in frozen checkpoint JSON)",
+    "inference_sampler": "sa",
+    "sampling_stage": "post_training_conditional_ising_latent_only",
+    "decoder_covariance": "diagonal",
+    "observation_noise": true
+  },
+  "hardware": {
+    "platform": "SPQC-550",
+    "sampler_mode": "SAMPLING",
+    "logical_n_bits": 48,
+    "hardware_n_bits": 49,
+    "auxiliary_spin_index": 48,
+    "candidate_gains": [125, 150, 200],
+    "reads_per_instance": 100,
+    "negtail_flip": false,
+    "sort_solutions": false,
+    "hardware_claim": false,
+    "physical_platform_used": false,
+    "platform_limits": {
+      "int8_coefficient_range": [-128, 127],
+      "int8_range_verified": true,
+      "int8_range_source": "local kaiwu_adapter validation",
+      "machine_profile": {"name": "SPQC-550", "max_variables": 550, "full_connectivity": true, "coupling_precision": "int8"}
+    }
+  },
+  "vs": {"instances": 10, "tasks": 30, "samples": 3000, "selection_split": "VS", "selection_seed": 2026, "selection_uses_power_labels": false},
+  "test": {"instances": 90, "tasks": 90, "samples": 9000, "selection_split": "TEST", "date_policy": "all frozen TEST dates in the historical fixed-window split", "require_unique_dates": true, "matrix_status": "logical h,J frozen; hardware gain unresolved until real VS calibration"},
+  "budget": {"planned_samples": 12000, "application_upper_limit": 15000, "sampling_credits_conversion": "pending confirmation after first real task", "backup_tasks_max": 0, "backup_samples_max": 0, "backup_condition": "no automatic reserve use; any exception requires separate manual confirmation"},
+  "gain_selection": {"allowed_split": "VS", "metrics": ["energy_wasserstein", "effective_beta_error", "edge_moment_mae", "magnetization_mae", "unique_state_fraction"], "read_convergence": [50, 100], "freeze_rule": "freeze exactly one gain after verified real VS responses; rebuild TEST Q from original h,J"},
+  "local_validation": {"float_control": "logical 48-spin SA at logical beta", "quantized_control": "49-spin int8 matrix SA at matrix_beta=logical_beta/hardware_gain", "mock_response": true, "raw_metrics_first": true, "calibration_and_ecc": "not run in this preparation", "hardware_claim": false, "physical_platform_used": false},
+  "freeze_requirements": {"test_data_used_for_gain_selection": false, "training_invoked": false, "overwrite_existing_results": false, "real_submission_executed": false}
+}

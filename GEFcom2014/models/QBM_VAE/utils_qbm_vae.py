@@ -68,7 +68,8 @@ class ConditionalQBMVAE(nn.Module):
                  transverse_field=0.0, trotter_replicas=4,
                  learnable_transverse_field=False, min_transverse_field=0.02,
                  max_transverse_field=5.0, decoder_covariance="diagonal",
-                 max_ar_coefficient=0.95, decoder_anchor=False):
+                 max_ar_coefficient=0.95, decoder_anchor=False,
+                 decoder_mean_zero_init=None):
         super().__init__()
         self.latent_s = latent_s
         self.cond_in = cond_in
@@ -89,6 +90,12 @@ class ConditionalQBMVAE(nn.Module):
         self.decoder_covariance = decoder_covariance
         self.max_ar_coefficient = float(max_ar_coefficient)
         self.decoder_anchor = bool(decoder_anchor)
+        # Preserve the historical behavior unless an ablation explicitly
+        # requests the same residual-head initialization without mean addition.
+        self.decoder_mean_zero_init = (
+            self.decoder_anchor if decoder_mean_zero_init is None
+            else bool(decoder_mean_zero_init)
+        )
         if self.decoder_anchor and cond_in < in_size:
             raise ValueError("decoder_anchor requires at least in_size context features")
         self.transverse_field_enabled = float(transverse_field) > 0.0
@@ -109,7 +116,7 @@ class ConditionalQBMVAE(nn.Module):
         dec_layers = [latent_s + context_size] + [dec_w] * dec_l + [decoder_multiplier * in_size]
         self.enc = _build_mlp(enc_layers)
         self.dec = _build_mlp(dec_layers)
-        if self.decoder_anchor:
+        if self.decoder_mean_zero_init:
             output_layer = self.dec[-1]
             with torch.no_grad():
                 output_layer.weight[:in_size].zero_()
@@ -134,6 +141,11 @@ class ConditionalQBMVAE(nn.Module):
         else:
             graph_mask = torch.tensor(graph_mask, dtype=torch.float32)
         self.register_buffer("graph_mask", graph_mask)
+        if not torch.count_nonzero(self.graph_mask):
+            # Keep a J=0 ablation structurally and parametrically independent.
+            with torch.no_grad():
+                self.raw_j.zero_()
+            self.raw_j.requires_grad_(False)
         self.register_buffer("persistent_spins", torch.empty(0, latent_s))
         self.register_buffer("persistent_replicas", torch.empty(0, self.trotter_replicas, latent_s))
         self.to(self.device)
@@ -726,6 +738,8 @@ def fit_qbm_vae(nb_epoch, x_LS, y_LS, x_VS, y_VS, x_TEST, y_TEST, model, opt, sa
         if validation_score < best_vs:
             best_vs = validation_score
             best_model = copy.deepcopy(model)
+            best_model.selection_epoch = int(epoch)
+            best_model.selection_metric = "VS reconstruction"
             epochs_without_improvement = 0
         else:
             epochs_without_improvement += 1
