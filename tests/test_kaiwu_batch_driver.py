@@ -13,6 +13,7 @@ from GEFcom2014.models.QBM_VAE.run_kaiwu_13k_sampling import (
     planned_tasks,
     select_pending_tasks,
     _validate_execution_limits,
+    _load_frozen_gain,
     run,
 )
 from GEFcom2014.models.QBM_VAE.import_hardware_responses import strict_response_record_valid
@@ -157,6 +158,9 @@ def test_strict_response_rejects_missing_hash_reads_and_mock(tmp_path):
               "response_file_sha256": digest, "requested_reads": 10,
               "returned_reads": 10, "response_path": str(response),
               "hardware_claim": True, "physical_platform_used": True,
+              "submitted_at": "2026-01-01T00:00:00+00:00",
+              "completed_at": "2026-01-01T00:01:00+00:00",
+              "hardware_metadata_complete": True,
               "gain": 125, "sdk_version": "1.0.7",
               "platform_backend": "kaiwu.cim.CIMOptimizer",
               "sdk_versions": {"importlib_metadata_version": "1.4.1",
@@ -195,6 +199,9 @@ def test_pending_intent_recovery_accepts_only_same_task_record(tmp_path, monkeyp
               "response_path": str(response),
               "response_file_sha256": hashlib.sha256(response.read_bytes()).hexdigest(),
               "hardware_claim": True, "physical_platform_used": True,
+              "submitted_at": "2026-01-01T00:00:00+00:00",
+              "completed_at": "2026-01-01T00:01:00+00:00",
+              "hardware_metadata_complete": True,
               "sdk_version": "1.0.7", "platform_backend": "kaiwu.cim.CIMOptimizer",
               "sdk_versions": {"importlib_metadata_version": "1.4.1", "kaiwu_module_version": "1.0.7"}}
     monkeypatch.setattr(
@@ -207,3 +214,60 @@ def test_pending_intent_recovery_accepts_only_same_task_record(tmp_path, monkeyp
          "matrix_sha256": "mh", "requested_reads": 10, "task_name": "tn"},
     )
     assert recovered["task_name"] == "tn"
+
+
+def test_tampered_gain_freeze_is_rejected_before_test_planning(tmp_path, monkeypatch):
+    from GEFcom2014.models.QBM_VAE.kaiwu_13k_protocol import select_vs_gain
+    from tests.test_kaiwu_13k_protocol import _complete_vs_records
+
+    protocol_path = tmp_path / "protocol.json"
+    protocol_path.write_text("{}", encoding="utf-8")
+    prep_manifest = tmp_path / "preparation_manifest.json"
+    prep_manifest.write_text(json.dumps({"model_checkpoint_sha256": "model-hash"}), encoding="utf-8")
+    protocol = {
+        "_path": str(protocol_path),
+        "hardware": {"candidate_gains": [125, 150, 200]},
+        "vs": {"instances": 2},
+        "gain_selection": {"quality_gate": {
+            "status": "defined", "rule_version": "test-v1",
+            "thresholds_approved": True,
+            "thresholds": {"energy_wasserstein": 1.0,
+                            "effective_beta_error": 1.0,
+                            "edge_moment_mae": 1.0,
+                            "magnetization_mae": 1.0,
+                            "unique_state_fraction_min": 0.0},
+        }},
+    }
+    records = _complete_vs_records(tmp_path)
+    identity = {
+        "protocol_sha256": __import__("hashlib").sha256(protocol_path.read_bytes()).hexdigest(),
+        "model_checkpoint_sha256": "model-hash",
+        "preparation_manifest_sha256": __import__("hashlib").sha256(prep_manifest.read_bytes()).hexdigest(),
+    }
+    for row in records:
+        row.update(identity)
+    tasks = [{"stage": "vs", "instance_id": row["instance_id"], "gain": row["gain"],
+              "matrix_sha256": row["matrix_sha256"], "requested_reads": row["requested_reads"],
+              "task_name": row["task_name"], **identity} for row in records]
+    monkeypatch.setattr(
+        "GEFcom2014.models.QBM_VAE.run_kaiwu_13k_sampling._vs_tasks",
+        lambda preparation, protocol: tasks,
+    )
+    freeze = select_vs_gain(
+        records, tmp_path / "real_gain_selection.json",
+        required_gains=(125, 150, 200), expected_instances_per_gain=2,
+        expected_instance_ids=("vs_0", "vs_1"), expected_task_map={
+            (float(row["gain"]), row["instance_id"]): {
+                "stage": "vs", "instance_id": row["instance_id"], "gain": row["gain"],
+                "matrix_sha256": row["matrix_sha256"], "requested_reads": row["requested_reads"],
+                "task_name": row["task_name"], **identity,
+            } for row in records}, expected_identity=identity,
+        quality_policy=protocol["gain_selection"]["quality_gate"],
+    )
+    path = tmp_path / "real_gain_selection.json"
+    path.write_text(json.dumps(freeze), encoding="utf-8")
+    assert _load_frozen_gain(tmp_path, protocol)["selected_gain"] == 125.0
+    freeze["selected_gain"] = 150.0
+    path.write_text(json.dumps(freeze), encoding="utf-8")
+    with pytest.raises(RuntimeError, match="does not match"):
+        _load_frozen_gain(tmp_path, protocol)

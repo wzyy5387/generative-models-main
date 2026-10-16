@@ -73,7 +73,20 @@
       "unique_state_fraction"
     ],
     "read_convergence": [50, 100],
-    "freeze_rule": "freeze exactly one gain after VS; rebuild TEST Q from original h,J"
+    "freeze_rule": "freeze exactly one gain after VS; rebuild TEST Q from original h,J",
+    "quality_gate": {
+      "status": "pending_definition",
+      "rule_version": "fa-bm-vae-vs-quality-v1",
+      "format_gate": "strict response metadata, task identity, matrix hash, response hash, 100 returned reads, and finite metrics",
+      "quality_gate": "requires an explicit reviewer-approved quality_assessment.status=pass on every VS response",
+      "default_action": "lock TEST until a pre-defined quality policy is frozen",
+      "stop_rules": [
+        "any missing, duplicate, extra, or replacement VS condition",
+        "any non-finite metric, invalid spin, hash mismatch, or insufficient reads",
+        "any unresolved platform task status or unexpected billing",
+        "any candidate failing the pre-defined sampling-quality thresholds"
+      ]
+    }
   },
   "test_evaluation": {
     "raw_metrics_first": ["CRPS", "Energy", "Variogram", "Ramp CRPS", "coverage", "MAQCE"],

@@ -153,6 +153,7 @@ def submit_one(
         "returned_reads": returned_reads,
         "response_file_sha256": response_hash,
         "response_path": str(output_path.resolve()),
+        "hardware_metadata_complete": False,
     }
     # Validate the NPZ contents before promoting the audit flags.  A mock
     # client, incomplete metadata, malformed samples, or any hash mismatch
@@ -161,8 +162,10 @@ def submit_one(
         from .import_hardware_responses import strict_response_record_valid
         candidate = dict(audit, hardware_claim=True,
                          physical_platform_used=True, completed=True)
+        candidate["hardware_metadata_complete"] = True
         if strict_response_record_valid(candidate):
             audit.update(candidate)
+            audit["hardware_metadata_complete"] = True
     audit_path = output_dir / (str(instance_id) + ".json")
     audit_path.write_text(json.dumps(audit, indent=2), encoding="utf-8")
     return output_path, audit_path, audit

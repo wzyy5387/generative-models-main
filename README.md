@@ -636,10 +636,13 @@ D:\anaconda\envs\wsy\python.exe -m GEFcom2014.models.QBM_VAE.hardware_offline_pr
 This command is VS-only and uses local SA to create a deliberately labelled
 mock response. It never imports or calls the Kaiwu SDK.
 
-Kaiwu integration is optional and lazy. The runtime environment must provide
-the SDK license externally; `KAIWU_PROJECT_NO` is optional and intended for
-project-scoped tasks, not required for standard SPQC-550. No account, license,
-project number, or key is stored in the repository. The adapter uses
+Kaiwu integration is optional and lazy. Static inspection of the installed
+Kaiwu distribution/module versions supports the required sampling API, but
+account routing, license, Sampling Credits, and billing remain unverified. The
+runtime environment must provide the SDK license externally; `KAIWU_PROJECT_NO`
+is optional and intended for project-scoped tasks, not required for standard
+SPQC-550. No account, license, project number, or key is stored in the repository.
+The adapter uses
 `CIMOptimizer` in `SAMPLING` mode with a
 unique task name. The default regression suite submits no tasks.
 
@@ -785,7 +788,7 @@ corresponding experiments have already been completed.
   retained only as an initialization-confounded historical record. Raw metrics are
   primary; Cal and Cal+ECC are retained as matched sensitivity analyses.  The
   strict three-seed aggregation, date-block inference and Holm-adjusted
-  comparisons are under `export/opsd_sa_negative_matched_v1/main_table_seed012`.
+  comparisons are under `export/opsd_sa_negative_matched_v1/main_table_seed012_strict_no_anchor_v2`.
   This historical main-table candidate has `LIMITED_ACCEPTANCE`: model hashes
   and the SA negative-phase field are directly recorded, whereas the original
   command and a direct historical TEST-selection field are not recorded.

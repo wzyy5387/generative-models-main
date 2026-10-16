@@ -10,9 +10,11 @@ from GEFcom2014.models.QBM_VAE.kaiwu_13k_protocol import (
     load_protocol,
     select_vs_gain,
     scenario_metrics,
+    validate_vs_response_records,
     validate_test_manifest,
     validate_vs_manifests,
 )
+from GEFcom2014.forecast_quality.compare_scenarios import evaluate_model_daily
 
 
 def _vs_item(gain, index, zone):
@@ -37,6 +39,21 @@ def _test_item(index, zone):
         "hardware_gain": None,
         "hardware_n_bits": None,
         "zone": zone,
+    }
+
+
+def _approved_quality_policy():
+    return {
+        "status": "defined",
+        "rule_version": "test-v1",
+        "thresholds_approved": True,
+        "thresholds": {
+            "energy_wasserstein": 1.0,
+            "effective_beta_error": 1.0,
+            "edge_moment_mae": 1.0,
+            "magnetization_mae": 1.0,
+            "unique_state_fraction_min": 0.0,
+        },
     }
 
 
@@ -98,19 +115,97 @@ def test_vs_gain_selection_aggregates_fixed_panel_and_breaks_exact_ties_by_gain(
     records = []
     for gain in (125, 150, 200):
         for instance in range(2):
+            response = tmp_path / ("response_%d_%d.npz" % (gain, instance))
+            np.savez_compressed(
+                response, samples=np.ones((10, 49), dtype=np.int8),
+                instance_id="vs_%d" % instance, task_id="tid_%d_%d" % (gain, instance),
+                task_name="tn_%d_%d" % (gain, instance), matrix_sha256="mh_%d_%d" % (gain, instance),
+                stage="vs", hardware_gain=gain, requested_reads=10, returned_reads=10,
+            )
             records.append({
                 "gain": gain, "instance_id": "vs_%d" % instance,
+                "stage": "vs", "task_id": "tid_%d_%d" % (gain, instance),
+                "task_name": "tn_%d_%d" % (gain, instance),
+                "matrix_sha256": "mh_%d_%d" % (gain, instance),
+                "response_path": str(response),
+                "response_file_sha256": __import__("hashlib").sha256(response.read_bytes()).hexdigest(),
+                "requested_reads": 10, "returned_reads": 10,
+                "sdk_version": "1.0.7", "platform_backend": "kaiwu.cim.CIMOptimizer",
+                "submitted_at": "2026-01-01T00:00:00+00:00", "completed_at": "2026-01-01T00:01:00+00:00",
+                "hardware_metadata_complete": True, "completed": True,
                 "hardware_claim": True, "physical_platform_used": True,
+                "sdk_versions": {"importlib_metadata_version": "1.4.1", "kaiwu_module_version": "1.0.7"},
                 "energy_wasserstein": 0.1, "effective_beta_error": 0.01,
                 "edge_moment_mae": 0.02, "magnetization_mae": 0.02,
                 "unique_state_fraction": 0.9,
+                "quality_assessment": {"status": "pass", "rule_version": "test-v1"},
             })
     selected = select_vs_gain(
         records, tmp_path / "frozen.json", required_gains=(125, 150, 200),
-        expected_instances_per_gain=2,
+        expected_instances_per_gain=2, expected_instance_ids=("vs_0", "vs_1"),
+        quality_policy=_approved_quality_policy(),
     )
     assert selected["selected_gain"] == 125.0
     assert len(selected["candidate_metrics"]) == 3
+
+
+def _complete_vs_records(tmp_path):
+    records = []
+    for gain in (125, 150, 200):
+        for instance in range(2):
+            instance_id = "vs_%d" % instance
+            response = tmp_path / ("valid_%d_%d.npz" % (gain, instance))
+            np.savez_compressed(
+                response, samples=np.ones((10, 49), dtype=np.int8),
+                instance_id=instance_id, task_id="tid_%d_%d" % (gain, instance),
+                task_name="tn_%d_%d" % (gain, instance), matrix_sha256="mh_%d_%d" % (gain, instance),
+                stage="vs", hardware_gain=gain, requested_reads=10, returned_reads=10,
+            )
+            records.append({
+                "completed": True, "instance_id": instance_id, "stage": "vs",
+                "task_id": "tid_%d_%d" % (gain, instance), "task_name": "tn_%d_%d" % (gain, instance),
+                "matrix_sha256": "mh_%d_%d" % (gain, instance),
+                "response_file_sha256": __import__("hashlib").sha256(response.read_bytes()).hexdigest(),
+                "requested_reads": 10, "returned_reads": 10, "response_path": str(response),
+                "gain": gain, "sdk_version": "1.0.7", "platform_backend": "kaiwu.cim.CIMOptimizer",
+                "submitted_at": "2026-01-01T00:00:00+00:00", "completed_at": "2026-01-01T00:01:00+00:00",
+                "hardware_metadata_complete": True, "hardware_claim": True,
+                "physical_platform_used": True,
+                "sdk_versions": {"importlib_metadata_version": "1.4.1", "kaiwu_module_version": "1.0.7"},
+                "energy_wasserstein": 0.1, "effective_beta_error": 0.01,
+                "edge_moment_mae": 0.02, "magnetization_mae": 0.02,
+                "unique_state_fraction": 0.9,
+                "quality_assessment": {"status": "pass", "rule_version": "test-v1"},
+            })
+    return records
+
+
+@pytest.mark.parametrize("mutation", [
+    lambda rows: rows.pop(),
+    lambda rows: rows.append(dict(rows[-1])),
+    lambda rows: rows.__setitem__(-1, {**rows[-1], "instance_id": "vs_0"}),
+    lambda rows: rows.__setitem__(0, {**rows[0], "matrix_sha256": "tampered"}),
+    lambda rows: rows.__setitem__(0, {**rows[0], "energy_wasserstein": float("nan")}),
+    lambda rows: rows.__setitem__(0, {**rows[0], "returned_reads": 9}),
+])
+def test_vs_freeze_rejects_incomplete_or_untrusted_records(tmp_path, mutation):
+    records = _complete_vs_records(tmp_path)
+    mutation(records)
+    with pytest.raises(ValueError):
+        validate_vs_response_records(
+            records, required_gains=(125, 150, 200), expected_instances_per_gain=2,
+            expected_instance_ids=("vs_0", "vs_1"),
+            quality_policy=_approved_quality_policy(),
+        )
+
+
+def test_vs_freeze_rejects_missing_quality_policy(tmp_path):
+    with pytest.raises(ValueError, match="quality policy"):
+        validate_vs_response_records(
+            _complete_vs_records(tmp_path), required_gains=(125, 150, 200),
+            expected_instances_per_gain=2, expected_instance_ids=("vs_0", "vs_1"),
+            quality_policy=None,
+        )
 
 
 def test_read_convergence_and_test_metrics_keep_reads_within_instance():
@@ -131,3 +226,18 @@ def test_read_convergence_and_test_metrics_keep_reads_within_instance():
     result = aggregate_test_metrics(rows, repetitions=100)
     assert result["reads_are_independent_test_units"] is False
     assert result["paired_comparisons"][0]["n_instance_dates"] == 3
+
+
+def test_hardware_metric_adapter_matches_classical_daily_definition():
+    rng = np.random.default_rng(7)
+    samples = rng.normal(size=(100, 24))
+    target = rng.normal(size=24)
+    classical = evaluate_model_daily(samples.T, target.reshape(1, -1), max_s=100)
+    hardware = scenario_metrics(samples, target)
+    mapping = {
+        "CRPS": "CRPS_raw", "Energy": "Energy", "Variogram": "Variogram",
+        "Ramp_CRPS": "ramp_CRPS", "coverage": "PICP90",
+        "PICP90": "PICP90", "interval_width90": "interval_width90", "MAQCE": "MAQCE",
+    }
+    for hardware_name, classical_name in mapping.items():
+        assert np.isclose(hardware[hardware_name], classical[classical_name][0], atol=1e-12)

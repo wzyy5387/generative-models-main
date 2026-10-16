@@ -264,6 +264,13 @@ gain. No TEST result may select or alter that gain. The old 50-VS / 500-TEST /
 1000-read archive remains historical and must not be interpreted as this
 13,000-read submission plan.
 
+The installed Kaiwu distribution/module versions have been inspected and the
+required sampling API is present, but account routing, license, Sampling
+Credits, and billing remain unverified. Response format validation and sampling
+quality validation are separate gates. The current protocol has no approved
+quality threshold yet, so TEST remains locked until a versioned VS quality
+policy is explicitly frozen.
+
 The code and documentation are ready for a manually gated single-task canary,
 but submission is blocked until Sampling Credits and a licensed SDK/account
 environment are verified. `KAIWU_PROJECT_NO` is optional for standard SPQC-550
@@ -282,6 +289,19 @@ This command must be run only after the external conditions are confirmed.
 The remaining VS tasks use the same driver with `--resume`; TEST is blocked
 until the three VS gains are complete and the immutable VS-only gain selection
 record exists.
+
+### OPSD SA-negative quality-gate preparation
+
+The old fixed-window OPSD case is governed separately by
+`configs/paper/fa_bm_vae_opsd_sa_negative_kaiwu_protocol.json` and the new
+offline preparation directory
+`export/opsd_sa_negative_kaiwu_preparation_v5`. Its budget is 10 VS
+conditions x 3 gains x 100 reads (3,000) plus 90 frozen TEST dates x 100
+reads (9,000), for 12,000 requested reads. This does not change the generic
+13,000-read GEFCom plan above. The v5 quality audit estimates proposed limits
+from independent local SA repeats, but those limits are not hardware-validated
+or approved; TEST remains locked. The full offline audit is in
+`export/opsd_sa_negative_kaiwu_preparation_v5/QUALITY_GATE_REPORT.md`.
 
 ### FA-BM-VAE platform-to-scenario reconstruction
 

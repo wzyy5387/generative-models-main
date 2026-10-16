@@ -17,16 +17,22 @@ ROOT_DIR = Path(__file__).resolve().parents[3]
 DEFAULT_OUTPUT_DIR = ROOT_DIR / "export" / "bosonic_responses" / "imported"
 
 
-def strict_response_record_valid(record, expected=None):
+def strict_response_record_valid(record, expected=None, require_physical=True):
     """Validate both the audit record and the raw 49-spin NPZ contents."""
     if not isinstance(record, dict) or record.get("completed") is not True:
         return False
     required = ("instance_id", "stage", "task_id", "task_name", "matrix_sha256",
                 "response_file_sha256", "requested_reads", "returned_reads",
-                "response_path", "gain", "sdk_version", "platform_backend")
+                "response_path", "gain", "sdk_version", "platform_backend",
+                "submitted_at", "completed_at", "hardware_metadata_complete")
     if any(not str(record.get(key, "")) for key in required):
         return False
-    if record.get("hardware_claim") is not True or record.get("physical_platform_used") is not True:
+    if require_physical:
+        if record.get("hardware_claim") is not True or record.get("physical_platform_used") is not True:
+            return False
+    elif record.get("hardware_claim") is not False or record.get("physical_platform_used") is not False:
+        return False
+    if record.get("hardware_metadata_complete") is not True:
         return False
     try:
         requested = int(record["requested_reads"])
@@ -70,17 +76,16 @@ def strict_response_record_valid(record, expected=None):
     except (OSError, KeyError, TypeError, ValueError, IndexError):
         return False
     if expected:
-        for key in ("stage", "instance_id", "gain", "matrix_sha256", "requested_reads", "task_name"):
-            if key in expected:
-                if key == "gain":
-                    try:
-                        if float(record.get(key)) != float(expected[key]):
-                            return False
-                    except (TypeError, ValueError):
+        for key, expected_value in expected.items():
+            if key == "gain":
+                try:
+                    if float(record.get(key)) != float(expected_value):
                         return False
-                elif str(record.get(key)) != str(expected[key]):
+                except (TypeError, ValueError):
                     return False
-    if record.get("platform_backend") != "kaiwu.cim.CIMOptimizer":
+            elif str(record.get(key, "")) != str(expected_value):
+                return False
+    if require_physical and record.get("platform_backend") != "kaiwu.cim.CIMOptimizer":
         return False
     versions = record.get("sdk_versions", {})
     if not isinstance(versions, dict) or not versions.get("importlib_metadata_version") or not versions.get("kaiwu_module_version"):
@@ -372,6 +377,12 @@ def import_responses(
         output_path = output_dir / (instance_id + ".npz")
         response_arrays = {
             "samples": logical_samples,
+            "instance_id": str(instance_id),
+            "task_name": str(metadata.get("task_name", "")),
+            "matrix_sha256": str(matrix_hash or ""),
+            "stage": str(submission["stage"]),
+            "hardware_gain": float(instance.get("hardware_gain", -1.0) or -1.0),
+            "bit_order": "index_descending" if reverse else "index_ascending",
             "latency_s": float(metadata.get("latency_s", np.nan)),
             "applied_scale": float(metadata.get("applied_scale", np.nan)),
             "backend": str(metadata.get("backend", "bosonic_platform")),
@@ -405,8 +416,8 @@ def import_responses(
             samples.shape[0] == submission["requested_reads_per_instance"] and
             True
         )
-        response_arrays["hardware_claim"] = False
-        response_arrays["physical_platform_used"] = False
+        response_arrays["hardware_claim"] = bool(platform_complete)
+        response_arrays["physical_platform_used"] = bool(platform_complete)
         if is_hardware_response:
             response_arrays.update(
                 {
@@ -419,6 +430,7 @@ def import_responses(
                 }
             )
         np.savez_compressed(output_path, **response_arrays)
+        canonical_hash = sha256_file(output_path)
         records.append(
             {
                 "instance_id": instance_id,
@@ -440,8 +452,9 @@ def import_responses(
                         metadata.get("job_id", metadata.get("task_name", "")),
                     )
                 ),
-                "hardware_matrix_sha256": matrix_hash,
                 "task_name": str(metadata.get("task_name", "")),
+                "matrix_sha256": matrix_hash,
+                "hardware_matrix_sha256": matrix_hash,
                 "sdk_version": str(metadata.get("sdk_version", "")),
                 "sdk_versions": {
                     "importlib_metadata_version": str(metadata.get("kaiwu_distribution_version", "")),
@@ -450,10 +463,16 @@ def import_responses(
                 "platform_backend": str(metadata.get("platform_backend", "")),
                 "submitted_at": str(metadata.get("submitted_at", "")),
                 "completed_at": str(metadata.get("completed_at", "")),
-                "response_file_sha256": sha256_file(response_path),
+                "response_path": str(output_path.resolve()),
+                "response_file_sha256": canonical_hash,
                 "checkpoint_dir": str(metadata.get("checkpoint_dir", "")),
-                "hardware_claim": False,
-                "physical_platform_used": False,
+                "requested_reads": int(metadata.get(
+                    "requested_reads", submission["requested_reads_per_instance"]
+                )),
+                "returned_reads": int(samples.shape[0]),
+                "completed": bool(platform_complete),
+                "hardware_claim": bool(platform_complete),
+                "physical_platform_used": bool(platform_complete),
                 "hardware_metadata_complete": bool(platform_complete),
             }
         )

@@ -15,6 +15,7 @@ import numpy as np
 from .compare_hardware_responses import compare_response_pair, response_statistics
 from .ising import ising_energy
 from .kaiwu_adapter import kaiwu_sdk_versions
+from GEFcom2014.forecast_quality.compare_scenarios import evaluate_model_daily
 
 
 ROOT_DIR = Path(__file__).resolve().parents[3]
@@ -66,6 +67,9 @@ def validate_protocol(protocol):
         raise ValueError("Planned sample budget does not match protocol counts")
     if protocol["budget"]["application_upper_limit"] != 15000:
         raise ValueError("Application upper limit must be 15000")
+    quality_gate = protocol.get("gain_selection", {}).get("quality_gate")
+    if quality_gate is not None and quality_gate.get("default_action") != "lock TEST until a pre-defined quality policy is frozen":
+        raise ValueError("VS quality gate must fail closed until explicitly frozen")
     limits = hardware.get("platform_limits", {})
     if limits.get("int8_coefficient_range") != [-128, 127]:
         raise ValueError("Protocol must record the verified int8 coefficient range")
@@ -91,6 +95,8 @@ def _forbidden_target_keys(instance):
 
 def validate_vs_manifests(paths, protocol):
     expected_gains = protocol["hardware"]["candidate_gains"]
+    if len(paths) != len(expected_gains):
+        raise ValueError("VS manifests must contain exactly one manifest per candidate gain")
     manifests = []
     id_sets = []
     for path, gain in zip(paths, expected_gains):
@@ -234,8 +240,30 @@ def compare_read_convergence(h, j, reference, candidate, target_beta=1.0):
     return result
 
 
+def aggregate_gain_metrics(response_records):
+    """Aggregate calibration metrics from response records, never from a summary."""
+    grouped = {}
+    for record in response_records:
+        grouped.setdefault(float(record["gain"]), []).append(record)
+    rows = []
+    for gain, records in sorted(grouped.items()):
+        rows.append({
+            "gain": gain,
+            "n_verified_instances": len(records),
+            "energy_wasserstein": float(np.mean([row["energy_wasserstein"] for row in records])),
+            "effective_beta_error": float(np.mean([row["effective_beta_error"] for row in records])),
+            "edge_moment_mae": float(np.mean([row["edge_moment_mae"] for row in records])),
+            "magnetization_mae": float(np.mean([row["magnetization_mae"] for row in records])),
+            "unique_state_fraction": float(np.mean([row["unique_state_fraction"] for row in records])),
+        })
+    return rows
+
+
 def select_vs_gain(response_records, output_path, target_beta=1.0,
-                   required_gains=None, expected_instances_per_gain=None):
+                   required_gains=None, expected_instances_per_gain=None,
+                   expected_instance_ids=None, expected_task_map=None,
+                   expected_identity=None, quality_policy=None,
+                   require_physical=True):
     """Freeze one gain from verified physical VS records.
 
     Metrics are averaged within each gain across the fixed VS panel. Ties use
@@ -243,11 +271,26 @@ def select_vs_gain(response_records, output_path, target_beta=1.0,
     """
     if not response_records:
         raise ValueError("No VS response records supplied")
+    if required_gains is not None or expected_instances_per_gain is not None:
+        response_records = validate_vs_response_records(
+            response_records,
+            required_gains=required_gains,
+            expected_instances_per_gain=expected_instances_per_gain,
+            expected_instance_ids=expected_instance_ids,
+            expected_task_map=expected_task_map,
+            expected_identity=expected_identity,
+            quality_policy=quality_policy,
+            require_quality_policy=False,
+            require_physical=require_physical,
+        )
     for record in response_records:
         if float(record.get("gain")) not in (125.0, 150.0, 200.0):
             raise ValueError("VS response gain is outside the frozen candidate grid")
-        if not record.get("hardware_claim") or not record.get("physical_platform_used"):
-            raise ValueError("Gain selection requires verified physical VS responses")
+        if require_physical:
+            if not record.get("hardware_claim") or not record.get("physical_platform_used"):
+                raise ValueError("Gain selection requires verified physical VS responses")
+        elif record.get("hardware_claim") is not False or record.get("physical_platform_used") is not False:
+            raise ValueError("Offline gain selection requires hardware_claim=false")
         for key in ("energy_wasserstein", "effective_beta_error", "edge_moment_mae",
                     "magnetization_mae", "unique_state_fraction"):
             if key not in record:
@@ -257,20 +300,21 @@ def select_vs_gain(response_records, output_path, target_beta=1.0,
         grouped.setdefault(float(record["gain"]), []).append(record)
     if required_gains is not None and set(grouped) != {float(gain) for gain in required_gains}:
         raise ValueError("VS gain selection does not contain exactly the frozen candidate grid")
-    candidate_metrics = []
-    for gain, records in sorted(grouped.items()):
-        if expected_instances_per_gain is not None and len(records) != int(expected_instances_per_gain):
-            raise ValueError("VS gain %s does not have the required number of verified instances" % gain)
-        candidate_metrics.append({
-            "gain": gain,
-            "n_verified_instances": len(records),
-            "energy_wasserstein": float(np.mean([row["energy_wasserstein"] for row in records])),
-            "effective_beta_error": float(np.mean([row["effective_beta_error"] for row in records])),
-            "edge_moment_mae": float(np.mean([row["edge_moment_mae"] for row in records])),
-            "magnetization_mae": float(np.mean([row["magnetization_mae"] for row in records])),
-            "unique_state_fraction": float(np.mean([row["unique_state_fraction"] for row in records])),
-        })
-    chosen = min(candidate_metrics, key=lambda row: (
+    if expected_instances_per_gain is not None:
+        for gain, records in grouped.items():
+            if len(records) != int(expected_instances_per_gain):
+                raise ValueError("VS gain %s does not have the required number of verified instances" % gain)
+    candidate_metrics = aggregate_gain_metrics(response_records)
+    if required_gains is not None:
+        if not isinstance(quality_policy, dict):
+            raise ValueError("No VS quality policy is defined; TEST remains locked")
+        candidate_metrics = evaluate_gain_quality(candidate_metrics, quality_policy)
+        qualified = [row for row in candidate_metrics if row["quality_status"] == "pass"]
+        if not qualified:
+            raise ValueError("All candidate gains failed the VS quality gate; TEST remains locked")
+    else:
+        qualified = candidate_metrics
+    chosen = min(qualified, key=lambda row: (
         row["energy_wasserstein"], row["effective_beta_error"], row["edge_moment_mae"],
         row["magnetization_mae"], -row["unique_state_fraction"], row["gain"],
     ))
@@ -280,28 +324,115 @@ def select_vs_gain(response_records, output_path, target_beta=1.0,
     payload = {
         "method_name": "FA-BM-VAE",
         "selection_split": "VS",
-        "hardware_claim": True,
-        "physical_platform_used": True,
+        "hardware_claim": bool(require_physical),
+        "physical_platform_used": bool(require_physical),
         "selected_gain": float(chosen["gain"]),
         "selection_metric": "lexicographic mean energy Wasserstein, effective-beta error, edge-moment MAE, magnetization MAE, negative unique-state fraction, then lower gain",
         "selection_metrics": chosen,
         "candidate_metrics": candidate_metrics,
         "immutable": True,
         "test_peeking": False,
-        "verified_vs_records": [
-            {"instance_id": str(row.get("instance_id", "")),
-             "task_id": str(row.get("task_id", "")),
-             "task_name": str(row.get("task_name", "")),
-             "gain": float(row["gain"]),
-             "matrix_sha256": str(row.get("matrix_sha256", "")),
-             "response_file_sha256": str(row.get("response_file_sha256", ""))}
-            for row in response_records
-        ],
+        "test_data_used": False,
+        "verified_vs_records": [dict(row) for row in response_records],
         "n_verified_vs_records": len(response_records),
     }
+    if expected_identity:
+        payload.update({key: str(value) for key, value in expected_identity.items()})
+    if quality_policy is not None:
+        payload["quality_gate"] = dict(quality_policy)
+        payload["quality_summary_recomputed"] = True
     output_path.parent.mkdir(parents=True, exist_ok=True)
     output_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
     return payload
+
+
+def _finite_metric_record(record):
+    keys = ("energy_wasserstein", "effective_beta_error", "edge_moment_mae",
+            "magnetization_mae", "unique_state_fraction")
+    try:
+        values = [float(record[key]) for key in keys]
+    except (KeyError, TypeError, ValueError):
+        return False
+    return bool(np.isfinite(values).all())
+
+
+def validate_vs_response_records(response_records, required_gains,
+                                 expected_instances_per_gain,
+                                 expected_instance_ids=None,
+                                 expected_task_map=None, expected_identity=None,
+                                 quality_policy=None, require_quality_policy=True,
+                                 require_physical=True):
+    """Validate the complete physical VS panel before gain selection.
+
+    This is deliberately stricter than checking ``hardware_claim``.  The
+    response file, task identity, matrix identity, reads, provenance hashes,
+    finite calibration metrics, and an explicit quality decision all have to
+    agree with the frozen protocol.
+    """
+    from .import_hardware_responses import strict_response_record_valid
+
+    gains = {float(gain) for gain in required_gains}
+    expected_ids = {str(item) for item in expected_instance_ids} if expected_instance_ids is not None else None
+    if len(response_records) != len(gains) * int(expected_instances_per_gain):
+        raise ValueError("VS responses must contain exactly gain x instance unique combinations")
+    seen = set()
+    for record in response_records:
+        try:
+            gain = float(record["gain"])
+        except (KeyError, TypeError, ValueError):
+            raise ValueError("VS response has no valid gain")
+        instance_id = str(record.get("instance_id", ""))
+        key = (gain, instance_id)
+        if gain not in gains or not instance_id or key in seen:
+            raise ValueError("VS response panel contains an extra or duplicate condition")
+        if expected_ids is not None and instance_id not in expected_ids:
+            raise ValueError("VS response contains a condition outside the frozen VS panel")
+        expected = expected_task_map.get(key) if expected_task_map else None
+        if not strict_response_record_valid(record, expected, require_physical=require_physical):
+            raise ValueError("VS response failed raw task, metadata, hash, shape, or read validation")
+        if expected_identity:
+            for field, value in expected_identity.items():
+                if str(record.get(field, "")) != str(value):
+                    raise ValueError("VS response provenance does not match frozen %s" % field)
+        if not _finite_metric_record(record):
+            raise ValueError("VS response contains a non-finite calibration metric")
+        if require_quality_policy and quality_policy is None:
+            raise ValueError("No VS quality policy is defined; TEST remains locked")
+        seen.add(key)
+    for gain in gains:
+        ids = {str(row["instance_id"]) for row in response_records if float(row["gain"]) == gain}
+        if len(ids) != int(expected_instances_per_gain) or (expected_ids is not None and ids != expected_ids):
+            raise ValueError("VS gain %s does not contain the exact frozen instance panel" % gain)
+    return list(response_records)
+
+
+def evaluate_gain_quality(candidate_metrics, quality_policy):
+    """Recompute gain-level quality from verified response metrics.
+
+    ``quality_assessment`` fields supplied by a platform or mock are ignored.
+    Thresholds are intentionally fail-closed until explicitly approved from an
+    independent reference audit.
+    """
+    if quality_policy.get("status") != "defined" or quality_policy.get("thresholds_approved") is not True:
+        raise ValueError("VS quality thresholds are not approved; TEST remains locked")
+    thresholds = quality_policy.get("thresholds")
+    if not isinstance(thresholds, dict):
+        raise ValueError("VS quality policy lacks thresholds")
+    error_metrics = ("energy_wasserstein", "effective_beta_error",
+                     "edge_moment_mae", "magnetization_mae")
+    output = []
+    for row in candidate_metrics:
+        checks = {metric: float(row[metric]) <= float(thresholds[metric])
+                  for metric in error_metrics}
+        checks["unique_state_fraction"] = (
+            float(row["unique_state_fraction"]) >= float(thresholds["unique_state_fraction_min"])
+        )
+        item = dict(row)
+        item["quality_checks"] = checks
+        item["quality_status"] = "pass" if all(checks.values()) else "fail"
+        item["quality_rule_version"] = str(quality_policy["rule_version"])
+        output.append(item)
+    return output
 
 
 def crps_ensemble(samples, target):
@@ -315,32 +446,31 @@ def crps_ensemble(samples, target):
 
 
 def scenario_metrics(samples, target):
+    """Return the canonical daily metrics used by the classical evaluator.
+
+    ``samples`` is reads x horizon and ``target`` is one horizon.  The common
+    evaluator consumes periods x reads, so this adapter performs only that
+    explicit orientation conversion; all score definitions, Variogram beta
+    (0.5), ramp CRPS, 90-percent coverage, and interval width come from the
+    canonical implementation.
+    """
     samples = np.asarray(samples, dtype=np.float64)
     target = np.asarray(target, dtype=np.float64)
     if samples.ndim != 2 or target.shape != (samples.shape[1],):
         raise ValueError("samples/target shape must be (reads,horizon)/(horizon,)")
-    crps = crps_ensemble(samples, target)
-    energy = float(np.mean(np.linalg.norm(samples - target[None, :], axis=1)) -
-                   0.5 * np.mean(np.linalg.norm(samples[:, None, :] - samples[None, :, :], axis=2)))
-    ramps = np.diff(samples, axis=1)
-    target_ramp = np.diff(target)
-    ramp_crps = crps_ensemble(ramps, target_ramp) if ramps.shape[1] else 0.0
-    pairwise = np.abs(samples[:, :, None] - samples[:, None, :])
-    target_pairwise = np.abs(target[:, None] - target[None, :])
-    variogram = float(np.mean((pairwise.mean(axis=0) - target_pairwise) ** 2))
-    coverages = np.asarray([
-        np.mean(target <= np.quantile(samples, level, axis=0))
-        for level in np.linspace(0.05, 0.95, 19)
-    ])
-    levels = np.linspace(0.05, 0.95, 19)
+    daily = evaluate_model_daily(
+        samples.T, target.reshape(1, -1), max_s=samples.shape[0],
+        periods_per_day=target.size,
+    )
     return {
-        "CRPS": crps,
-        "Energy": energy,
-        "Variogram": variogram,
-        "Ramp_CRPS": ramp_crps,
-        "coverage": float(np.mean((target >= np.quantile(samples, 0.05, axis=0)) &
-                                   (target <= np.quantile(samples, 0.95, axis=0)))),
-        "MAQCE": float(np.mean(np.abs(coverages - levels))),
+        "CRPS": float(daily["CRPS_raw"][0]),
+        "Energy": float(daily["Energy"][0]),
+        "Variogram": float(daily["Variogram"][0]),
+        "Ramp_CRPS": float(daily["ramp_CRPS"][0]),
+        "coverage": float(daily["PICP90"][0]),
+        "PICP90": float(daily["PICP90"][0]),
+        "interval_width90": float(daily["interval_width90"][0]),
+        "MAQCE": float(daily["MAQCE"][0]),
     }
 
 
@@ -368,7 +498,7 @@ def aggregate_test_metrics(rows, reference_model="float_logical_sa", repetitions
     grouped = {}
     for row in rows:
         key = (str(row["date"]), str(row["model"]))
-        grouped.setdefault(key, {metric: [] for metric in ("CRPS", "Energy", "Variogram", "Ramp_CRPS", "coverage", "MAQCE")})
+        grouped.setdefault(key, {metric: [] for metric in ("CRPS", "Energy", "Variogram", "Ramp_CRPS", "coverage", "PICP90", "interval_width90", "MAQCE")})
         for metric in grouped[key]:
             grouped[key][metric].append(float(row[metric]))
     means = {(date, model): {metric: float(np.mean(values)) for metric, values in data.items()}
@@ -380,7 +510,7 @@ def aggregate_test_metrics(rows, reference_model="float_logical_sa", repetitions
     for model in models:
         if model == reference_model:
             continue
-        for metric in ("CRPS", "Energy", "Variogram", "Ramp_CRPS", "coverage", "MAQCE"):
+        for metric in ("CRPS", "Energy", "Variogram", "Ramp_CRPS", "coverage", "PICP90", "interval_width90", "MAQCE"):
             diffs = [means[(date, model)][metric] - means[(date, reference_model)][metric]
                      for date in sorted({date for date, _ in means})
                      if (date, model) in means and (date, reference_model) in means]
