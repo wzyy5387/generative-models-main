@@ -32,6 +32,32 @@ from GEFcom2014.utils import dump_file
 from numpyencoder import NumpyEncoder
 from torch.utils.benchmark import timer
 
+GENERATION_SPLIT_SEED_OFFSETS = {"VS": 0, "TEST": 1000003}
+
+
+def build_generation_seed_metadata(training_seed, generation_seed=None):
+    """Return explicit generation seed provenance without changing legacy defaults."""
+    explicit = generation_seed is not None
+    base_seed = int(training_seed if generation_seed is None else generation_seed)
+    split_seeds = (
+        {split: base_seed + offset
+         for split, offset in GENERATION_SPLIT_SEED_OFFSETS.items()}
+        if explicit else None
+    )
+    return {
+        "generation_sampler_seed": base_seed,
+        "generation_sampler_seed_role": (
+            "base_seed_for_explicit_split_samplers"
+            if explicit
+            else "legacy_sampler_seed; split seeds are not separately recorded"
+        ),
+        "generation_seed": int(generation_seed) if explicit else None,
+        "generation_seed_explicit": explicit,
+        "generation_split_seed_offsets": dict(GENERATION_SPLIT_SEED_OFFSETS),
+        "generation_split_seeds": split_seeds,
+        "generation_sampler_seeds": dict(split_seeds) if split_seeds is not None else None,
+    }
+
 
 def parse_args():
     config_parser = argparse.ArgumentParser(add_help=False)
@@ -194,6 +220,8 @@ def parse_args():
         help="Generate only these splits. Use VS alone while developing graph candidates.",
     )
     parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument("--generation-seed", type=int, default=None,
+                        help="Optional seed independent of training for scenario generation.")
     parser.add_argument("--run-label", default="", help="Optional suffix for model/scenario filenames.")
     parser.add_argument("--zone-embedding-dim", type=int, default=0)
     parser.add_argument("--nb-zones", type=int, default=0)
@@ -208,6 +236,21 @@ def parse_args():
     if config_args.config is not None:
         with config_args.config.open("r", encoding="utf-8") as handle:
             defaults = json.load(handle)
+        fixed_generation_settings = {
+            "generation_split_seed_offsets": GENERATION_SPLIT_SEED_OFFSETS,
+            "generation_sa_settings": {
+                "sweeps": 200,
+                "beta_start": 0.1,
+                "constructor_beta_end": 2.0,
+                "beta_argument": 1.0,
+                "effective_beta_end": 1.0,
+            },
+            "generation_observation_noise": True,
+            "generation_day_batch_size": 50,
+        }
+        for key, expected in fixed_generation_settings.items():
+            if key in defaults and defaults[key] != expected:
+                raise ValueError("Config %s does not match the frozen generation settings" % key)
         valid_destinations = {action.dest for action in parser._actions}
         metadata_only = {
             "method_name",
@@ -226,6 +269,10 @@ def parse_args():
             "historical_graph_json_note",
             "training_seed_policy",
             "generation_seed_policy",
+            "generation_split_seed_offsets",
+            "generation_sa_settings",
+            "generation_observation_noise",
+            "generation_day_batch_size",
         }
         unknown = sorted(set(defaults) - valid_destinations - metadata_only)
         if unknown:
@@ -243,6 +290,9 @@ def parse_args():
     if args.validation_only:
         args.scenario_splits = ["VS"]
         args.skip_plots = True
+    if args.generation_seed is not None and not (
+            0 <= args.generation_seed <= 2**63 - 1 - max(GENERATION_SPLIT_SEED_OFFSETS.values())):
+        parser.error("--generation-seed is outside the supported non-negative seed range")
     return args
 
 
@@ -681,7 +731,28 @@ if __name__ == "__main__":
     config["random_graph_density"] = args.random_graph_density
     config["scenario_splits"] = list(args.scenario_splits)
     config["validation_only"] = bool(args.validation_only)
-    config["generation_sampler_seed"] = int(args.seed)
+    seed_metadata = build_generation_seed_metadata(args.seed, args.generation_seed)
+    effective_generation_seed = seed_metadata["generation_sampler_seed"]
+    config.update(seed_metadata)
+    config["training_seed"] = int(args.seed)
+    config["generation_seed_policy"] = (
+        "explicit generation seed plus fixed split offsets"
+        if args.generation_seed is not None else "legacy shared sequential RNG stream"
+    )
+    config["generation_sampler"] = sampler_name
+    config["generation_sampler_settings"] = {
+        "sa_sweeps": 200,
+        "sa_beta_start": 0.1,
+        "sa_constructor_beta_end": 2.0,
+        "sa_beta_argument": float(config["beta"]),
+        "sa_effective_beta_end": float(config["beta"]),
+    }
+    if sampler_name == "path-integral":
+        config["generation_sampler_settings"]["trotter_replicas"] = int(
+            args.trotter_replicas
+        )
+    config["generation_observation_noise"] = True
+    config["generation_day_batch_size"] = 50
     config["zone_embedding_dim"] = args.zone_embedding_dim
     config["nb_zones"] = args.nb_zones
     config["dataset_bundle"] = str(args.dataset_bundle.resolve()) if args.dataset_bundle else None
@@ -865,18 +936,30 @@ if __name__ == "__main__":
     scenarios_by_split = {}
     split_inputs = {"VS": x_VS_scaled, "TEST": x_TEST_scaled}
     for split in args.scenario_splits:
+        split_seed = (config["generation_split_seeds"][split]
+                      if config["generation_split_seeds"] is not None else None)
+        split_sampler = sampler
+        noise_generator = None
+        if args.generation_seed is not None:
+            noise_generator = torch.Generator(device=best_model.device)
+            noise_generator.manual_seed(split_seed)
+            if sampler_name == "sa":
+                generation_sampler_kwargs = dict(sampler_kwargs)
+                generation_sampler_kwargs["seed"] = split_seed
+                split_sampler = build_sampler("sa", **generation_sampler_kwargs)
         scenarios_by_split[split] = build_qbm_vae_scenarios(
             n_s=n_s,
             x=split_inputs[split],
             y_scaler=y_LS_scaler,
             model=best_model,
-            sampler=sampler,
+            sampler=split_sampler,
             max=1,
             gpu=gpu,
             tag=tag,
             non_null_indexes=non_null_indexes,
             beta=config["beta"],
             gibbs_steps=config["negative_steps"],
+            generator=noise_generator,
         )
         dump_file(
             dir=dir_path,

@@ -1,6 +1,7 @@
 # -*- coding: utf-8 -*-
 
 import argparse
+import hashlib
 import json
 import pickle
 from pathlib import Path
@@ -173,6 +174,8 @@ def main():
             "h": h,
             "J": j,
             "x_cond": x_cond,
+            "protocol_version": np.asarray(args.protocol_version),
+            "protocol_sha256": np.asarray(args.protocol_sha256),
             "physical_h": physical_h,
             "physical_J": physical_j,
             "transverse_gamma": gamma,
@@ -227,10 +230,17 @@ def main():
             model_role=model_role,
             hardware_problem=hardware_problem,
         )
+        payload["protocol_version"] = args.protocol_version
+        payload["protocol_sha256"] = args.protocol_sha256
+        payload["source_problem_path"] = relative_or_absolute(output_dir / (stem + ".npz"))
+        payload["source_problem_sha256"] = hashlib.sha256(
+            (output_dir / (stem + ".npz")).read_bytes()
+        ).hexdigest()
         if hardware_problem is not None:
             payload["hardware_matrix_file"] = relative_or_absolute(hardware_matrix_path)
             payload["task_name"] = build_task_name(
                 stem, hardware_problem["audit"]["matrix_sha256"],
+                protocol_id=args.protocol_version,
                 stage=("vs-calibration" if args.split == "VS" else "test-evaluation"),
                 gain=args.hardware_gain,
             )
@@ -248,6 +258,8 @@ def main():
                 "platform replaces only frozen conditional Ising latent sampling"
             ),
             "hardware_claim": False,
+            "protocol_version": args.protocol_version,
+            "protocol_sha256": args.protocol_sha256,
             "anchor_source": model_config.get("anchor_source", "none"),
             "prior_type": model_config.get("prior_type", "classical_ising"),
             "logical_n_bits": int(h.shape[0]),
@@ -309,6 +321,8 @@ def main():
                 "model": model_name,
                 "track": args.tag,
                 "split": args.split,
+                "protocol_version": args.protocol_version,
+                "protocol_sha256": args.protocol_sha256,
                 "n_instances": len(instances),
             },
             indent=2,
@@ -547,6 +561,8 @@ def parse_args():
         default="head",
     )
     parser.add_argument("--selection-seed", type=int, default=2026)
+    parser.add_argument("--protocol-version", default="fa-bm-vae-kaiwu-13k-v1")
+    parser.add_argument("--protocol-sha256", default="")
     parser.add_argument(
         "--indices-file",
         type=Path,

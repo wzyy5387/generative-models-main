@@ -43,7 +43,7 @@ ROOT_DIR = Path(__file__).resolve().parents[3]
 # SA-negative seed-0 checkpoint.  Keep the legacy internal-Gibbs protocol as a
 # separate, explicit input rather than making it the accidental CLI default.
 DEFAULT_PROTOCOL = ROOT_DIR / "configs" / "paper" / "fa_bm_vae_opsd_sa_negative_kaiwu_protocol.json"
-DEFAULT_OUTPUT = ROOT_DIR / "export" / "opsd_sa_negative_kaiwu_preparation_v4"
+DEFAULT_OUTPUT = ROOT_DIR / "export" / "opsd_sa_negative_kaiwu_preparation_v8"
 MODEL_NAME = "opsd-wind_QBMVAE_2_anchor_sa_neg_sa_0"
 
 
@@ -270,6 +270,8 @@ def _run_export(protocol, output_dir, split, hardware_gain=None, indices_file=No
         "--num-instances", str(protocol["vs"]["instances"] if split == "VS" else protocol["test"]["instances"]),
         "--selection", "stratified" if split == "VS" else "all",
         "--selection-seed", str(protocol["dataset"]["selection_seed"]),
+        "--protocol-version", protocol["protocol_version"],
+        "--protocol-sha256", sha256_file(protocol["_path"]),
         "--output-dir", str(output_dir), "--cpu",
     ]
     if hardware_gain is not None:
@@ -281,6 +283,89 @@ def _run_export(protocol, output_dir, split, hardware_gain=None, indices_file=No
     if len(manifests) != 1:
         raise RuntimeError("Expected one exporter manifest in %s" % output_dir)
     return manifests[0], command
+
+
+def _build_quality_reference_manifest(output_dir, protocol, vs_manifests):
+    entries = []
+    for gain, manifest_path in zip(protocol["hardware"]["candidate_gains"], vs_manifests):
+        package = output_dir / ("submission_gain_%d" % gain) / "package"
+        package_manifest = json.loads((package / "submission_manifest.json").read_text(encoding="utf-8"))
+        package_items = {row["instance_id"]: row for row in package_manifest["instances"]}
+        for item in json.loads(Path(manifest_path).read_text(encoding="utf-8")):
+            problem_path = _repo_path(item["path"])
+            package_item = package_items[str(item["id"])]
+            matrix_path = package / package_item["hardware_matrix"]
+            sample_path = output_dir / "local_controls" / ("gain_%d" % gain) / "quantized" / "sa" / (str(item["id"]) + ".npz")
+            with np.load(problem_path, allow_pickle=False) as problem:
+                h = np.asarray(problem["h"], dtype=np.float64)
+                j = np.asarray(problem["J"], dtype=np.float64)
+            with np.load(matrix_path, allow_pickle=False) as matrix_archive:
+                matrix = np.asarray(matrix_archive["hardware_matrix"], dtype=np.int8)
+            with np.load(sample_path, allow_pickle=False) as sample:
+                required = ("samples", "hardware_samples", "backend", "matrix_space",
+                            "instance_id", "random_seed", "requested_reads", "sweeps",
+                            "sampler_beta", "matrix_beta", "logical_beta", "hardware_gain",
+                            "protocol_sha256", "hardware_matrix_sha256", "source_problem_sha256")
+                missing = [key for key in required if key not in sample]
+                if missing:
+                    raise ValueError("SA reference lacks provenance fields: %s" % ", ".join(missing))
+                logical = np.asarray(sample["samples"], dtype=np.int8)
+                raw = np.asarray(sample["hardware_samples"], dtype=np.int8)
+                metadata = {key: np.asarray(sample[key]).reshape(-1)[0].item()
+                            for key in required if key not in ("samples", "hardware_samples")}
+            expected_beta = float(protocol["gain_selection"]["prediction_evaluation"].get("logical_beta", 1.0)) / float(gain)
+            if (h.shape != (48,) or j.shape != (48, 48) or matrix.shape != (49, 49)
+                    or logical.shape != (100, 48) or raw.shape != (100, 49)
+                    or not np.isin(logical, (-1, 1)).all() or not np.isin(raw, (-1, 1)).all()
+                    or metadata["backend"] != "sa" or metadata["matrix_space"] != "hardware-quantized"
+                    or str(metadata["instance_id"]) != str(item["id"])
+                    or int(metadata["requested_reads"]) != 100
+                    or int(metadata["sweeps"]) != 100
+                    or int(metadata["hardware_gain"]) != int(gain)
+                    or not np.isclose(float(metadata["sampler_beta"]), expected_beta, rtol=0, atol=1e-12)
+                    or not np.isclose(float(metadata["matrix_beta"]), expected_beta, rtol=0, atol=1e-12)
+                    or str(metadata["hardware_matrix_sha256"]) != matrix_sha256(matrix)
+                    or str(metadata["source_problem_sha256"]) != sha256_file(problem_path)
+                    or str(metadata["protocol_sha256"]) != sha256_file(protocol["_path"])
+                    or not np.isclose(float(metadata["logical_beta"]),
+                                      float(protocol["gain_selection"]["prediction_evaluation"].get("logical_beta", 1.0)),
+                                      rtol=0, atol=1e-12)):
+                raise ValueError("SA reference provenance/configuration mismatch for %s" % item["id"])
+            entries.append({
+                "gain": int(gain), "instance_id": str(item["id"]),
+                "split": item["split"], "date": item["date"],
+                "protocol_sha256": sha256_file(protocol["_path"]),
+                "source_problem_path": str(problem_path.resolve()),
+                "source_problem_sha256": sha256_file(problem_path),
+                "hardware_matrix_path": str(matrix_path.resolve()),
+                "hardware_matrix_file_sha256": sha256_file(matrix_path),
+                "hardware_matrix_sha256": matrix_sha256(matrix),
+                "reference_sample_path": str(sample_path.resolve()),
+                "reference_sample_sha256": sha256_file(sample_path),
+                "sampler": {"backend": "sa", "matrix_space": "hardware-quantized",
+                            "reads": 100, "sweeps": 100,
+                            "seed": int(metadata["random_seed"]),
+                            "sampler_beta": float(metadata["sampler_beta"]),
+                            "matrix_beta": float(metadata["matrix_beta"]),
+                            "logical_beta": float(metadata["logical_beta"])},
+                "hardware_claim": False, "physical_platform_used": False,
+            })
+    expected = len(protocol["hardware"]["candidate_gains"]) * int(protocol["vs"]["instances"])
+    keys = [(row["gain"], row["instance_id"]) for row in entries]
+    if len(entries) != expected or len(set(keys)) != expected:
+        raise ValueError("Quality reference must cover every unique gain-condition pair")
+    target = Path(output_dir) / "quality_reference_manifest.json"
+    _json_dump(target, {
+        "artifact_role": "offline_classical_sa_quality_reference",
+        "protocol_version": protocol["protocol_version"],
+        "protocol_sha256": sha256_file(protocol["_path"]),
+        "sampling_configuration": {"backend": "sa", "matrix_space": "hardware-quantized",
+                                   "reads": 100, "sweeps": 100, "logical_beta": 1.0},
+        "instances": entries,
+        "hardware_claim": False, "physical_platform_used": False,
+        "eligible_for_paper": False,
+    })
+    return target
 
 
 def _make_mock_responses(package_manifest, quantized_response_dir, output_dir):
@@ -302,6 +387,7 @@ def _make_mock_responses(package_manifest, quantized_response_dir, output_dir):
             hardware_matrix_sha256=item["hardware_matrix_sha256"],
             bit_order="index_ascending",
             backend="offline_sa_mock",
+            protocol_sha256=payload["protocol_sha256"],
             requested_reads=100,
             returned_reads=int(raw.shape[0]),
             hardware_claim=False,
@@ -309,7 +395,7 @@ def _make_mock_responses(package_manifest, quantized_response_dir, output_dir):
         )
 
 
-def audit_exported_matrices(manifests, output_path):
+def audit_exported_matrices(manifests, output_path, protocol_sha256=None):
     records = []
     for manifest_path in manifests:
         for item in json.loads(Path(manifest_path).read_text(encoding="utf-8")):
@@ -317,6 +403,10 @@ def audit_exported_matrices(manifests, output_path):
                 h = np.asarray(problem["h"], dtype=np.float64)
                 j = np.asarray(problem["J"], dtype=np.float64)
                 q = np.asarray(problem["hardware_matrix"], dtype=np.int8)
+                source_hash = str(np.asarray(problem.get(
+                    "protocol_sha256", np.asarray(""))).reshape(-1)[0])
+            if protocol_sha256 is not None and source_hash != protocol_sha256:
+                raise ValueError("Exported Ising problem protocol hash mismatch for %s" % item["id"])
             rng = np.random.default_rng(2026 + int(item["index"]))
             spins = rng.choice(np.asarray([-1.0, 1.0]), size=(8, 48))
             augmented = np.concatenate((spins, np.ones((8, 1))), axis=1)
@@ -345,6 +435,7 @@ def audit_exported_matrices(manifests, output_path):
                 "energy_mapping_max_abs_error": energy_error,
             })
     _json_dump(output_path, {
+        "protocol_sha256": protocol_sha256,
         "hardware_claim": False,
         "physical_platform_used": False,
         "records": records,
@@ -403,6 +494,8 @@ def prepare(protocol_path=DEFAULT_PROTOCOL, output_dir=DEFAULT_OUTPUT):
     protocol = load_protocol(protocol_path)
     protocol["_path"] = str(protocol_path)
     output_dir.mkdir(parents=True, exist_ok=True)
+    if any(output_dir.iterdir()):
+        raise FileExistsError("Preparation output must be a new empty directory: %s" % output_dir)
     freeze, arrays, y_scaler = audit_frozen_model(protocol, output_dir)
     _, _, bundle_dates = load_daily_bundle(_model_paths(protocol)["dataset"])
     rows = select_vs_rows(arrays["x_vs"], protocol["dataset"]["selection_seed"], protocol["vs"]["instances"])
@@ -410,6 +503,8 @@ def prepare(protocol_path=DEFAULT_PROTOCOL, output_dir=DEFAULT_OUTPUT):
     _json_dump(indices_file, rows.tolist())
     _json_dump(output_dir / "vs_selection_manifest.json", {
         "selection_seed": protocol["dataset"]["selection_seed"],
+        "protocol_version": protocol["protocol_version"],
+        "protocol_sha256": sha256_file(protocol_path),
         "selection_rule": "mean of first 24 forecast-context columns, ten deterministic strata, no y access",
         "indices": rows.tolist(), "dates": [str(bundle_dates["vs"][i]) for i in rows],
         "test_data_used": False, "hardware_claim": False, "physical_platform_used": False,
@@ -425,7 +520,8 @@ def prepare(protocol_path=DEFAULT_PROTOCOL, output_dir=DEFAULT_OUTPUT):
         prepare_submission(manifest, output_dir / ("submission_gain_%d" % gain),
                            "vs-calibration", protocol["hardware"]["reads_per_instance"])
 
-    matrix_audit = audit_exported_matrices(vs_manifests, output_dir / "matrix_audit.json")
+    matrix_audit = audit_exported_matrices(
+        vs_manifests, output_dir / "matrix_audit.json", sha256_file(protocol_path))
 
     test_export_dir = output_dir / "test_logical"
     test_manifest, command = _run_export(protocol, test_export_dir, "TEST")
@@ -434,6 +530,8 @@ def prepare(protocol_path=DEFAULT_PROTOCOL, output_dir=DEFAULT_OUTPUT):
     if test_manifest.resolve() != test_manifest_out.resolve():
         test_manifest_out = test_manifest
     budget = audit_budget(vs_manifests, test_manifest_out, protocol)
+    budget["protocol_version"] = protocol["protocol_version"]
+    budget["protocol_sha256"] = sha256_file(protocol_path)
     _json_dump(output_dir / "budget_audit.json", budget)
 
     manifest_hashes = {
@@ -456,6 +554,7 @@ def prepare(protocol_path=DEFAULT_PROTOCOL, output_dir=DEFAULT_OUTPUT):
                 "--manifest", str(manifest), "--backend", "sa", "--num-reads", "100",
                 "--beta", "1.0", "--sweeps", "100", "--seed", "2026",
                 "--matrix-space", matrix_space, "--output-dir", str(target_dir),
+                "--protocol-sha256", sha256_file(protocol_path),
             ], cwd=ROOT_DIR, check=True)
         quantized_response_dir = quantized_root / "sa"
         package_manifest = output_dir / ("submission_gain_%d" % gain) / "package" / "submission_manifest.json"
@@ -468,8 +567,11 @@ def prepare(protocol_path=DEFAULT_PROTOCOL, output_dir=DEFAULT_OUTPUT):
             _repo_path(protocol["model"]["checkpoint"]), _repo_path(protocol["model"]["model_config"]),
         ))
 
+    quality_reference_manifest = _build_quality_reference_manifest(output_dir, protocol, vs_manifests)
+
     prep_manifest = {
         "artifact_role": "offline_hardware_preparation",
+        "protocol_version": protocol["protocol_version"],
         "eligible_for_paper": False,
         "hardware_claim": False,
         "physical_platform_used": False,
@@ -485,6 +587,7 @@ def prepare(protocol_path=DEFAULT_PROTOCOL, output_dir=DEFAULT_OUTPUT):
         "matrix_audit_sha256": sha256_file(output_dir / "matrix_audit.json"),
         "matrix_audit_records": len(matrix_audit),
         "manifest_hashes": manifest_hashes,
+        "quality_reference_manifest_sha256": sha256_file(quality_reference_manifest),
         "test_data_used_for_gain_selection": False,
         "real_platform_submitted": False,
         "local_validation": {

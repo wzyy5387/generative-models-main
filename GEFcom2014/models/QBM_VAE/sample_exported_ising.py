@@ -3,6 +3,7 @@
 """Generate SA/CIM reference responses for a fixed exported Ising benchmark."""
 
 import argparse
+import hashlib
 import json
 from pathlib import Path
 
@@ -35,6 +36,10 @@ def main():
         with np.load(problem_path) as problem:
             logical_h = np.asarray(problem["h"], dtype=np.float64)
             logical_j = np.asarray(problem["J"], dtype=np.float64)
+            source_protocol_sha256 = str(np.asarray(problem.get(
+                "protocol_sha256", np.asarray(""))).reshape(-1)[0])
+            if args.protocol_sha256 and source_protocol_sha256 != args.protocol_sha256:
+                raise ValueError("Sampling protocol hash differs from exported Ising problem")
             if args.matrix_space == "hardware-quantized":
                 if "hardware_matrix" not in problem:
                     raise ValueError(
@@ -101,6 +106,12 @@ def main():
             "matrix_space": args.matrix_space,
             "hardware_claim": False,
             "physical_platform_used": False,
+            "instance_id": str(instance["id"]),
+            "random_seed": int(args.seed + index),
+            "requested_reads": int(args.num_reads),
+            "sweeps": int(args.sweeps),
+            "logical_beta": float(logical_beta),
+            "protocol_sha256": str(args.protocol_sha256 or source_protocol_sha256),
         }
         if args.matrix_space == "hardware-quantized":
             arrays.update(
@@ -111,6 +122,9 @@ def main():
                     "auxiliary_spin_index": np.asarray(logical_n_bits),
                     "hardware_matrix_sha256": np.asarray(
                         instance.get("hardware_matrix_sha256", "")
+                    ),
+                    "source_problem_sha256": np.asarray(
+                        hashlib.sha256(problem_path.read_bytes()).hexdigest()
                     ),
                     "hardware_gain": np.asarray(
                         hardware_gain
@@ -141,6 +155,7 @@ def parse_args():
         help="Compare float logical Ising SA or the exact quantized 49-spin matrix SA.",
     )
     parser.add_argument("--seed", type=int, default=2026)
+    parser.add_argument("--protocol-sha256", default="")
     parser.add_argument("--output-dir", default=str(DEFAULT_OUTPUT_DIR))
     return parser.parse_args()
 

@@ -207,7 +207,12 @@ def build_task_name(instance_id, matrix_hash, run_id=None, protocol_id="fa-bm-va
     safe_instance = "".join(ch if ch.isalnum() or ch in "-_" else "_" for ch in str(instance_id))
     safe_protocol = "".join(ch if ch.isalnum() or ch in "-_" else "_" for ch in str(protocol_id))
     safe_stage = "".join(ch if ch.isalnum() or ch in "-_" else "_" for ch in str(stage))
-    gain_part = "na" if gain is None else str(gain).replace(".", "_")
+    if gain is None:
+        gain_part = "na"
+    else:
+        numeric_gain = float(gain)
+        gain_part = (str(int(numeric_gain)) if numeric_gain.is_integer()
+                     else format(numeric_gain, ".15g").replace(".", "_"))
     return "fa_bm_vae_%s_%s_%s_g%s_%s" % (safe_protocol, safe_stage, safe_instance, gain_part, str(matrix_hash)[:16])
 
 

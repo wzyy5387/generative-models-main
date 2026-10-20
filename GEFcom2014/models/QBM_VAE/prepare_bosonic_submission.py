@@ -7,6 +7,7 @@ import hashlib
 import json
 import shutil
 import zipfile
+from datetime import date, datetime
 from pathlib import Path
 
 import numpy as np
@@ -157,6 +158,63 @@ def write_deterministic_zip(package_dir, archive_path):
             archive.writestr(info, path.read_bytes())
 
 
+def validate_manifest_identity(instances, strict):
+    """Validate export identity before creating or clearing package files.
+
+    Protocol-tagged manifests use the current strict schema. Untagged legacy
+    manifests may omit identity fields; omitted values stay null and are never
+    inferred from filenames, list order, or current data.
+    """
+    required = ("index", "export_index", "date")
+    validated = []
+    seen_export_indices = set()
+    for position, instance in enumerate(instances):
+        if not isinstance(instance, dict):
+            raise ValueError("Manifest item %d must be an object" % position)
+        missing = [key for key in required if key not in instance or instance[key] is None]
+        if strict and missing:
+            raise ValueError(
+                "Strict protocol manifest item %d is missing required field(s): %s"
+                % (position, ", ".join(missing))
+            )
+        identity = {}
+        for key in ("index", "export_index"):
+            value = instance.get(key)
+            if value is None:
+                identity[key] = None
+                continue
+            if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+                raise ValueError(
+                    "Manifest item %d field %s must be a non-negative integer"
+                    % (position, key)
+                )
+            identity[key] = value
+        value = instance.get("date")
+        if value is None:
+            identity["date"] = None
+        elif not isinstance(value, str) or not value.strip():
+            raise ValueError("Manifest item %d field date must be a non-empty ISO date" % position)
+        else:
+            try:
+                datetime.fromisoformat(value.replace("Z", "+00:00"))
+            except ValueError:
+                try:
+                    date.fromisoformat(value)
+                except ValueError as error:
+                    raise ValueError(
+                        "Manifest item %d field date must be a valid ISO date/datetime"
+                        % position
+                    ) from error
+            identity["date"] = value
+        export_index = identity["export_index"]
+        if export_index is not None:
+            if export_index in seen_export_indices:
+                raise ValueError("Manifest export_index values must be unique")
+            seen_export_indices.add(export_index)
+        validated.append(identity)
+    return validated
+
+
 def prepare_submission(
     source_manifest,
     output_dir,
@@ -169,6 +227,37 @@ def prepare_submission(
     source_manifest = Path(source_manifest).resolve()
     output_dir = Path(output_dir).resolve()
     requested_reads = validate_sampling_reads(requested_reads)
+    instances = json.loads(source_manifest.read_text(encoding="utf-8"))
+    if not isinstance(instances, list):
+        raise ValueError("Source manifest must be a JSON list")
+    if not instances:
+        raise ValueError("Source manifest must contain at least one item")
+    if any(not isinstance(row, dict) for row in instances):
+        raise ValueError("Every source manifest item must be an object")
+    raw_versions = [row.get("protocol_version") for row in instances]
+    if any(value is not None and (not isinstance(value, str) or not value.strip())
+           for value in raw_versions):
+        raise ValueError("Manifest protocol_version must be a non-empty string when present")
+    protocol_versions = set(raw_versions)
+    if len(protocol_versions) > 1:
+        raise ValueError("Source manifest mixes protocol versions")
+    protocol_version = next(iter(protocol_versions), None)
+    protocol_hash_values = [row.get("protocol_sha256") for row in instances]
+    if any(value is not None and not isinstance(value, str) for value in protocol_hash_values):
+        raise ValueError("Manifest protocol_sha256 must be a string when present")
+    # A protocol hash without its version is not an untagged legacy manifest;
+    # reject it so deleting the version cannot downgrade strict validation.
+    if protocol_version is None and any(protocol_hash_values):
+        raise ValueError("Manifest protocol_sha256 requires an explicit protocol_version")
+    strict_identity = protocol_version is not None
+    identity_rows = validate_manifest_identity(instances, strict=strict_identity)
+    protocol_hashes = {row.get("protocol_sha256") for row in instances}
+    if len(protocol_hashes) > 1:
+        raise ValueError("Source manifest mixes protocol hashes")
+    protocol_sha256 = next(iter(protocol_hashes), None)
+
+    # Identity validation above intentionally precedes all filesystem writes,
+    # including directory creation and stale-file cleanup.
     package_dir = output_dir / "package"
     payload_dir = package_dir / "payloads"
     matrix_dir = package_dir / "hardware_matrices"
@@ -178,12 +267,11 @@ def prepare_submission(
         stale_payload.unlink()
     for stale_matrix in matrix_dir.glob("*.npz"):
         stale_matrix.unlink()
-    instances = json.loads(source_manifest.read_text(encoding="utf-8"))
     expected_split = "VS" if stage == "vs-calibration" else "TEST"
     records = []
     calibration_records = []
     hardware_gains = set()
-    for instance in instances:
+    for instance, identity in zip(instances, identity_rows):
         if instance.get("split") != expected_split:
             raise ValueError(
                 "Stage %s requires %s instances" % (stage, expected_split)
@@ -205,10 +293,15 @@ def prepare_submission(
         record = {
             "instance_id": instance["id"],
             "split": instance["split"],
+            **identity,
+            "identity_schema": "strict" if strict_identity else "legacy_nullable",
             "payload": str(destination.relative_to(package_dir).as_posix()),
             "payload_sha256": sha256_file(destination),
             **stats,
         }
+        if payload.get("protocol_sha256") != protocol_sha256:
+            raise ValueError("Payload protocol hash differs from source manifest for %s" % instance["id"])
+        record["protocol_sha256"] = payload.get("protocol_sha256", "")
         if "hardware_matrix_file" in payload:
             matrix_source = resolve_repo_path(payload["hardware_matrix_file"])
             if not matrix_source.is_file():
@@ -244,6 +337,7 @@ def prepare_submission(
         raise ValueError("A Kaiwu submission cannot mix hardware and logical-only instances")
 
     schema = {
+        "protocol_sha256": protocol_sha256,
         "required": {
             "instance_id": "must match the submitted instance",
             "samples": "2-D array with hardware_n_bits columns, using {-1,+1} or {0,1}",
@@ -286,6 +380,8 @@ def prepare_submission(
         "frozen": True,
         "target_labels_included": False,
         "source_manifest_sha256": sha256_file(source_manifest),
+        "protocol_version": protocol_version,
+        "protocol_sha256": protocol_sha256,
         "requested_reads_per_instance": int(requested_reads),
         "hardware_gain": next(iter(hardware_gains)) if hardware_gains else None,
         "n_instances": len(records),

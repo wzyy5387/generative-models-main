@@ -1,5 +1,5 @@
 {
-  "protocol_version": "fa-bm-vae-opsd-spqc-550-sa-negative-v2-quality-gate",
+  "protocol_version": "fa-bm-vae-opsd-spqc-550-sa-negative-v3-vs-crps",
   "method_name": "FA-BM-VAE",
   "dataset": {
     "name": "OPSD Wind",
@@ -31,23 +31,124 @@
     "logical_n_bits": 48,
     "hardware_n_bits": 49,
     "auxiliary_spin_index": 48,
-    "candidate_gains": [125, 150, 200],
+    "candidate_gains": [
+      125,
+      150,
+      200
+    ],
     "reads_per_instance": 100,
     "negtail_flip": false,
     "sort_solutions": false,
     "hardware_claim": false,
     "physical_platform_used": false,
     "platform_limits": {
-      "int8_coefficient_range": [-128, 127],
+      "int8_coefficient_range": [
+        -128,
+        127
+      ],
       "int8_range_verified": true,
       "int8_range_source": "local kaiwu_adapter validation",
-      "machine_profile": {"name": "SPQC-550", "max_variables": 550, "full_connectivity": true, "coupling_precision": "int8"}
+      "machine_profile": {
+        "name": "SPQC-550",
+        "max_variables": 550,
+        "full_connectivity": true,
+        "coupling_precision": "int8"
+      }
     }
   },
-  "vs": {"instances": 10, "tasks": 30, "samples": 3000, "selection_split": "VS", "selection_seed": 2026, "selection_uses_power_labels": false},
-  "test": {"instances": 90, "tasks": 90, "samples": 9000, "selection_split": "TEST", "date_policy": "all frozen TEST dates in the historical fixed-window split", "require_unique_dates": true, "matrix_status": "logical h,J frozen; hardware gain unresolved until real VS calibration"},
-  "budget": {"planned_samples": 12000, "application_upper_limit": 15000, "sampling_credits_conversion": "pending confirmation after first real task", "backup_tasks_max": 0, "backup_samples_max": 0, "backup_condition": "no automatic reserve use; any exception requires separate manual confirmation"},
-  "gain_selection": {"allowed_split": "VS", "metrics": ["energy_wasserstein", "effective_beta_error", "edge_moment_mae", "magnetization_mae", "unique_state_fraction"], "read_convergence": [50, 100], "freeze_rule": "freeze exactly one gain after verified real VS responses; rebuild TEST Q from original h,J", "quality_gate": {"status": "reference_estimated_pending_manual_approval", "rule_version": "opsd-sa-vs-quality-v1", "identity_gate": "all 30 gain-condition responses must pass strict task, matrix, response-hash, metadata, and 100-read validation", "aggregation": "recompute metrics from validated response files and aggregate by gain across the same 10 VS conditions; ignore supplied quality status fields", "reference_audit": "independent local float logical SA repeats; suggested thresholds are empirical null quantiles only", "thresholds_approved": false, "thresholds": null, "default_action": "lock TEST until a pre-defined quality policy is frozen", "quality_rule": {"error_metrics": "gain mean must be <= approved threshold for energy_wasserstein, effective_beta_error, edge_moment_mae, and magnetization_mae", "diversity_metric": "gain mean unique_state_fraction must be >= approved minimum", "selection": "select only among quality-pass gains; all fail or any identity/format failure locks TEST"}, "stop_rules": ["missing, duplicate, extra, or hash-mismatched response locks TEST", "non-finite recomputed metrics lock TEST", "all gains failing quality locks TEST", "thresholds without independent-reference evidence remain unapproved"]}},
-  "local_validation": {"float_control": "logical 48-spin SA at logical beta", "quantized_control": "49-spin int8 matrix SA at matrix_beta=logical_beta/hardware_gain", "mock_response": true, "raw_metrics_first": true, "calibration_and_ecc": "not run in this preparation", "hardware_claim": false, "physical_platform_used": false},
-  "freeze_requirements": {"test_data_used_for_gain_selection": false, "training_invoked": false, "overwrite_existing_results": false, "real_submission_executed": false}
+  "vs": {
+    "instances": 10,
+    "tasks": 30,
+    "samples": 3000,
+    "selection_split": "VS",
+    "selection_seed": 2026,
+    "selection_uses_power_labels": false
+  },
+  "test": {
+    "instances": 90,
+    "tasks": 90,
+    "samples": 9000,
+    "selection_split": "TEST",
+    "date_policy": "all frozen TEST dates in the historical fixed-window split",
+    "require_unique_dates": true,
+    "matrix_status": "logical h,J frozen; hardware gain unresolved until real VS calibration"
+  },
+  "budget": {
+    "planned_samples": 12000,
+    "application_upper_limit": 15000,
+    "sampling_credits_conversion": "pending confirmation after first real task",
+    "backup_tasks_max": 0,
+    "backup_samples_max": 0,
+    "backup_condition": "no automatic reserve use; any exception requires separate manual confirmation"
+  },
+  "gain_selection": {
+    "allowed_split": "VS",
+    "metrics": [
+      "raw_vs_crps",
+      "energy_wasserstein",
+      "effective_beta_error",
+      "edge_moment_mae",
+      "magnetization_mae",
+      "unique_state_fraction"
+    ],
+    "read_convergence": [
+      50,
+      100
+    ],
+    "freeze_rule": "after the complete engineering-valid real VS panel, minimize mean Raw VS CRPS; exact ties choose lower gain; do not require beating SA; TEST submission still requires separate explicit approval",
+    "prediction_evaluation": {
+      "noise_seed": 2026,
+      "noise_seed_rule": "base_plus_export_index",
+      "observation_noise": true,
+      "postprocessing": "raw_clip_0_1"
+    },
+    "quality_gate": {
+      "status": "defined",
+      "rule_version": "opsd-sa-vs-quality-v2-diagnostic-raw-crps",
+      "mode": "engineering_valid_prediction_selection",
+      "policy_approved": true,
+      "selection_metric": "raw_vs_crps",
+      "tie_break": "lower_gain",
+      "identity_gate": "all 30 gain-condition responses must pass strict task, matrix, response-hash, metadata, and 100-read validation",
+      "aggregation": "recompute metrics from validated response files and aggregate by gain across the same 10 VS conditions; ignore supplied quality status fields",
+      "reference_audit": "historical local-SA reference quantiles retained for diagnostics only; exceeding them is disclosed, not a hard rejection or proof of invalid hardware",
+      "thresholds_approved": false,
+      "thresholds": {
+        "energy_wasserstein": 0.30786660488035,
+        "effective_beta_error": 0.08898795986622078,
+        "edge_moment_mae": 0.11563023255813955,
+        "magnetization_mae": 0.11707916666666668
+      },
+      "default_action": "lock TEST until a pre-defined quality policy is frozen",
+      "quality_rule": {
+        "error_metrics": "record all four latent diagnostics and reference-threshold exceedances; none is a hard gate or gain-ranking criterion",
+        "diversity_metric": "unique_state_fraction is diagnostic only; repeated states are not a failure and no formal minimum is approved",
+        "selection": "all 30 expected responses must be engineering-valid; recompute mean Raw VS CRPS using frozen decoder, LS scalers and paired noise; no candidate dropping or TEST-based selection",
+        "independence": "threshold candidates must use disjoint local-SA repeat pairs aggregated over the same ten VS conditions; shared-sample pairwise rows are not independent replicates"
+      },
+      "stop_rules": [
+        "missing, duplicate, extra, or hash-mismatched response locks TEST",
+        "non-finite recomputed metrics lock TEST",
+        "missing or non-finite Raw VS CRPS or decoded scenarios locks TEST",
+        "diagnostic exceedances are reported, not silently relabeled as distributional agreement",
+        "unapproved policy, incomplete real VS freeze, or absent explicit TEST submission confirmation locks TEST"
+      ],
+      "diversity_gate_approved": false
+    }
+  },
+  "local_validation": {
+    "float_control": "logical 48-spin SA at logical beta",
+    "quantized_control": "49-spin int8 matrix SA at matrix_beta=logical_beta/hardware_gain",
+    "mock_response": true,
+    "raw_metrics_first": true,
+    "calibration_and_ecc": "not run in this preparation",
+    "hardware_claim": false,
+    "physical_platform_used": false
+  },
+  "freeze_requirements": {
+    "test_data_used_for_gain_selection": false,
+    "training_invoked": false,
+    "overwrite_existing_results": false,
+    "real_submission_executed": false
+  }
 }

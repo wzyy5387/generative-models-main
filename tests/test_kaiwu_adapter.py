@@ -22,6 +22,37 @@ from GEFcom2014.models.QBM_VAE.submit_kaiwu_sampling import submit_one
 from GEFcom2014.models.QBM_VAE import sample_exported_ising
 
 
+def _strict_submission_fixture(tmp_path, identity):
+    h = np.full(48, 0.2)
+    j = np.zeros((48, 48))
+    quantized = quantize_hardware_matrix(h, j, hardware_gain=20.0)
+    matrix_path = tmp_path / "matrix.npz"
+    np.savez_compressed(matrix_path, hardware_matrix=quantized["matrix"])
+    payload = build_platform_payload("strict_000", h, j, hardware_problem=quantized)
+    protocol_sha = "a" * 64
+    payload.update({
+        "hardware_matrix_file": str(matrix_path),
+        "task_name": "fa_bm_vae_strict_task",
+        "protocol_version": "strict-test-v1",
+        "protocol_sha256": protocol_sha,
+    })
+    payload_path = tmp_path / "payload.json"
+    payload_path.write_text(json.dumps(payload), encoding="utf-8")
+    manifest_item = {
+        "id": "strict_000",
+        "split": "VS",
+        "method_name": "FA-BM-VAE",
+        "platform_payload": str(payload_path),
+        "path": str(matrix_path),
+        "protocol_version": "strict-test-v1",
+        "protocol_sha256": protocol_sha,
+        **identity,
+    }
+    source_manifest = tmp_path / "strict_manifest.json"
+    source_manifest.write_text(json.dumps([manifest_item]), encoding="utf-8")
+    return source_manifest
+
+
 def test_kaiwu_sdk_audit_keeps_distribution_and_module_versions(monkeypatch):
     monkeypatch.setattr(
         "importlib.metadata.version", lambda name: "1.4.1"
@@ -205,6 +236,85 @@ def test_hardware_submission_and_import_keep_49_raw_and_48_logical(tmp_path):
         assert response["samples"].shape == (10, 48)
         np.testing.assert_array_equal(response["samples"][0], -np.ones(48, dtype=np.int8))
     assert audit["records"][0]["logical_n_bits"] == 48
+
+
+@pytest.mark.parametrize("missing", ["index", "export_index", "date"])
+def test_strict_protocol_missing_identity_fails_before_output_creation(tmp_path, missing):
+    identity = {"index": 4, "export_index": 0, "date": "2026-10-20"}
+    del identity[missing]
+    manifest = _strict_submission_fixture(tmp_path, identity)
+    output = tmp_path / "strict-output"
+    with pytest.raises(ValueError, match="missing required field"):
+        prepare_submission(manifest, output, "vs-calibration", requested_reads=10)
+    assert not output.exists()
+
+
+@pytest.mark.parametrize(
+    "field,value",
+    [
+        ("index", "4"),
+        ("index", -1),
+        ("export_index", 1.5),
+        ("export_index", True),
+        ("date", "2026-13-40"),
+        ("date", ""),
+    ],
+)
+def test_strict_protocol_malformed_identity_fails_before_output_creation(
+    tmp_path, field, value
+):
+    identity = {"index": 4, "export_index": 0, "date": "2026-10-20"}
+    identity[field] = value
+    manifest = _strict_submission_fixture(tmp_path, identity)
+    output = tmp_path / "strict-output"
+    with pytest.raises(ValueError):
+        prepare_submission(manifest, output, "vs-calibration", requested_reads=10)
+    assert not output.exists()
+
+
+def test_strict_protocol_valid_identity_is_preserved(tmp_path):
+    manifest = _strict_submission_fixture(
+        tmp_path, {"index": 64, "export_index": 0, "date": "2019-01-06 00:00:00"}
+    )
+    manifest_path, _, _ = prepare_submission(
+        manifest, tmp_path / "strict-output", "vs-calibration", requested_reads=10
+    )
+    record = json.loads(manifest_path.read_text(encoding="utf-8"))["instances"][0]
+    assert (record["index"], record["export_index"], record["date"]) == (
+        64, 0, "2019-01-06 00:00:00"
+    )
+    assert record["identity_schema"] == "strict"
+
+
+def test_legacy_manifest_keeps_missing_identity_fields_null(tmp_path):
+    h = np.full(48, 0.2)
+    j = np.zeros((48, 48))
+    quantized = quantize_hardware_matrix(h, j, hardware_gain=20.0)
+    matrix_path = tmp_path / "matrix.npz"
+    np.savez_compressed(matrix_path, hardware_matrix=quantized["matrix"])
+    payload = build_platform_payload("legacy_000", h, j, hardware_problem=quantized)
+    payload["hardware_matrix_file"] = str(matrix_path)
+    payload_path = tmp_path / "legacy_payload.json"
+    payload_path.write_text(json.dumps(payload), encoding="utf-8")
+    manifest = tmp_path / "legacy_manifest.json"
+    manifest.write_text(json.dumps([{
+        "id": "legacy_000", "split": "VS", "platform_payload": str(payload_path)
+    }]), encoding="utf-8")
+    manifest_path, _, _ = prepare_submission(
+        manifest, tmp_path / "legacy-output", "vs-calibration", requested_reads=10
+    )
+    record = json.loads(manifest_path.read_text(encoding="utf-8"))["instances"][0]
+    assert record["index"] is record["export_index"] is record["date"] is None
+    assert record["identity_schema"] == "legacy_nullable"
+
+
+def test_protocol_hash_without_version_cannot_downgrade_to_legacy(tmp_path):
+    manifest = tmp_path / "manifest.json"
+    manifest.write_text(json.dumps([{"id": "x", "protocol_sha256": "abc123"}]), encoding="utf-8")
+    output = tmp_path / "must-not-exist"
+    with pytest.raises(ValueError, match="requires an explicit protocol_version"):
+        prepare_submission(manifest, output, "vs-calibration", requested_reads=10)
+    assert not output.exists()
 
 
 def test_submit_one_uses_task_checkpoint_and_records_runtime_audit(tmp_path, monkeypatch):

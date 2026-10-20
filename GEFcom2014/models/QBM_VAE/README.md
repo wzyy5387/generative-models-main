@@ -1,5 +1,13 @@
 # QBM-VAE and transverse-field extension
 
+> Current OPSD status (2026-10-20): v8 is the frozen preparation package. The
+> approved policy uses engineering validity gates and diagnostic-only latent
+> indicators; a complete valid real VS panel selects gain by mean Raw VS CRPS,
+> with exact ties going to the smaller gain. Thresholds remain unapproved
+> references and do not gate gain selection. TEST requires separate explicit
+> confirmation. No real task has been submitted. See
+> [current OPSD operations status](../../../docs/OPSD_CURRENT_OPERATIONS_20261020.md).
+
 This directory contains two distinct prior models. They must not be described
 as the same method in experiments or papers.
 
@@ -237,7 +245,11 @@ advantage. A hardware claim requires responses returned by the physical
 platform for the same frozen payloads, alongside SA controls, read count,
 latency, failures, coefficient clipping, embedding, and platform metadata.
 
-## Current FA-BM-VAE Kaiwu 13k protocol
+## Historical generic FA-BM-VAE Kaiwu 13k protocol
+
+This section records the earlier generic GEFCom protocol and is not the
+current OPSD procedure. OPSD status and commands are maintained in
+`docs/OPSD_CURRENT_OPERATIONS_20261020.md`.
 
 The authoritative current plan is
 `configs/paper/fa_bm_vae_kaiwu_13k_protocol.json`. Training is classical:
@@ -264,12 +276,9 @@ gain. No TEST result may select or alter that gain. The old 50-VS / 500-TEST /
 1000-read archive remains historical and must not be interpreted as this
 13,000-read submission plan.
 
-The installed Kaiwu distribution/module versions have been inspected and the
-required sampling API is present, but account routing, license, Sampling
-Credits, and billing remain unverified. Response format validation and sampling
-quality validation are separate gates. The current protocol has no approved
-quality threshold yet, so TEST remains locked until a versioned VS quality
-policy is explicitly frozen.
+The installed Kaiwu distribution/module versions were inspected for this
+historical protocol. Account routing, license, Sampling Credits, and billing
+remain unverified. These statements do not describe the current OPSD v8 policy.
 
 The code and documentation are ready for a manually gated single-task canary,
 but submission is blocked until Sampling Credits and a licensed SDK/account
@@ -290,18 +299,24 @@ The remaining VS tasks use the same driver with `--resume`; TEST is blocked
 until the three VS gains are complete and the immutable VS-only gain selection
 record exists.
 
-### OPSD SA-negative quality-gate preparation
+### Historical OPSD SA-negative quality-gate preparation
 
-The old fixed-window OPSD case is governed separately by
-`configs/paper/fa_bm_vae_opsd_sa_negative_kaiwu_protocol.json` and the new
-offline preparation directory
-`export/opsd_sa_negative_kaiwu_preparation_v5`. Its budget is 10 VS
-conditions x 3 gains x 100 reads (3,000) plus 90 frozen TEST dates x 100
-reads (9,000), for 12,000 requested reads. This does not change the generic
-13,000-read GEFCom plan above. The v5 quality audit estimates proposed limits
-from independent local SA repeats, but those limits are not hardware-validated
-or approved; TEST remains locked. The full offline audit is in
-`export/opsd_sa_negative_kaiwu_preparation_v5/QUALITY_GATE_REPORT.md`.
+The historical fixed-window OPSD case was governed separately by
+`configs/paper/fa_bm_vae_opsd_sa_negative_kaiwu_protocol.json` and
+`export/opsd_sa_negative_kaiwu_preparation_v7`. Its budget is 3,000 VS plus
+9,000 TEST reads (12,000 total), distinct from the historical generic
+13,000-read GEFCom plan above. The four historical latent diagnostic thresholds
+were not approved as current sampling acceptance limits.
+
+Follow [the current pre-submission checklist](../../../docs/OPSD_SPQC550_PRE_SUBMISSION_CHECKLIST.md).
+These v7 instructions are historical. Current v8 diagnostic and authorization
+status is maintained in `docs/OPSD_CURRENT_OPERATIONS_20261020.md`. Do not use
+the generic GEFCom command above for OPSD.
+The old generic command above is not an OPSD submission command and no longer
+authorizes a batch: real non-canary submission additionally requires
+`--confirm-batch` and approved quality limits. Canary requires `--canary`, an
+exact frozen VS instance, `--limit 1`, and separate `--confirm-canary` approval.
+Invalid responses stop the batch immediately without automatic retries.
 
 ### FA-BM-VAE platform-to-scenario reconstruction
 

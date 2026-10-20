@@ -580,7 +580,7 @@ class ConditionalQBMVAE(nn.Module):
         )
 
     def sample(self, n_s=1, x_cond=None, sampler=None, beta=1.0, observation_noise=True,
-               scale_multiplier=1.0, gibbs_steps=50):
+               scale_multiplier=1.0, gibbs_steps=50, generator=None):
         if x_cond is None:
             x_cond = np.zeros(self.cond_in, dtype=np.float32)
         context = torch.tensor(np.tile(x_cond, n_s).reshape(n_s, self.cond_in), device=self.device).float()
@@ -614,7 +614,10 @@ class ConditionalQBMVAE(nn.Module):
 
         mean, log_scale, rho = self.decode_temporal_parameters(z, context)
         if observation_noise:
-            noise = scale_multiplier * torch.randn_like(mean)
+            noise = scale_multiplier * (
+                torch.randn_like(mean) if generator is None else
+                torch.randn(mean.shape, dtype=mean.dtype, device=mean.device, generator=generator)
+            )
             if getattr(self, "decoder_covariance", "diagonal") == "ar1":
                 residual = sample_standardized_ar_residuals(
                     noise, torch.exp(log_scale), rho
@@ -769,7 +772,8 @@ def fit_qbm_vae(nb_epoch, x_LS, y_LS, x_VS, y_VS, x_TEST, y_TEST, model, opt, sa
 
 def build_qbm_vae_scenarios(n_s, x, y_scaler, model, sampler=None, max=1, gpu=True, tag=None,
                             non_null_indexes=None, beta=1.0, scale_multiplier=1.0,
-                            observation_noise=True, gibbs_steps=50, day_batch_size=50):
+                            observation_noise=True, gibbs_steps=50, day_batch_size=50,
+                            generator=None):
     if sampler is not None and hasattr(sampler, "sample_ising_batch") and not model.uses_path_integral():
         return _build_batched_qbm_vae_scenarios(
             n_s=n_s,
@@ -784,6 +788,7 @@ def build_qbm_vae_scenarios(n_s, x, y_scaler, model, sampler=None, max=1, gpu=Tr
             scale_multiplier=scale_multiplier,
             observation_noise=observation_noise,
             day_batch_size=day_batch_size,
+            generator=generator,
         )
     scenarios = []
     for i in range(x.shape[0]):
@@ -795,6 +800,7 @@ def build_qbm_vae_scenarios(n_s, x, y_scaler, model, sampler=None, max=1, gpu=Tr
             scale_multiplier=scale_multiplier,
             observation_noise=observation_noise,
             gibbs_steps=gibbs_steps,
+            generator=generator,
         )
         samples = y_scaler.inverse_transform(samples)
         samples = np.clip(samples, 0, max)
@@ -808,7 +814,7 @@ def build_qbm_vae_scenarios(n_s, x, y_scaler, model, sampler=None, max=1, gpu=Tr
 
 def _build_batched_qbm_vae_scenarios(n_s, x, y_scaler, model, sampler, max_value, tag,
                                      non_null_indexes, beta, scale_multiplier,
-                                     observation_noise, day_batch_size):
+                                     observation_noise, day_batch_size, generator=None):
     scenario_chunks = []
     model.eval()
     with torch.no_grad():
@@ -832,7 +838,10 @@ def _build_batched_qbm_vae_scenarios(n_s, x, y_scaler, model, sampler, max_value
             context = context_days.repeat_interleave(n_s, dim=0)
             mean, log_scale, rho = model.decode_temporal_parameters(z, context)
             if observation_noise:
-                noise = scale_multiplier * torch.randn_like(mean)
+                noise = scale_multiplier * (
+                    torch.randn_like(mean) if generator is None else
+                    torch.randn(mean.shape, dtype=mean.dtype, device=mean.device, generator=generator)
+                )
                 if getattr(model, "decoder_covariance", "diagonal") == "ar1":
                     residual = sample_standardized_ar_residuals(
                         noise, torch.exp(log_scale), rho

@@ -14,7 +14,7 @@ import numpy as np
 
 from .compare_hardware_responses import compare_response_pair, response_statistics
 from .ising import ising_energy
-from .kaiwu_adapter import kaiwu_sdk_versions
+from .kaiwu_adapter import kaiwu_sdk_versions, normalize_hardware_spins, matrix_sha256
 from GEFcom2014.forecast_quality.compare_scenarios import evaluate_model_daily
 
 
@@ -25,6 +25,8 @@ DEFAULT_OUTPUT = ROOT_DIR / "export" / "kaiwu_13k_preparation"
 
 def resolve_path(path):
     path = Path(path)
+    if path.is_file():
+        return path
     return path if path.is_absolute() else ROOT_DIR / path
 
 
@@ -240,30 +242,141 @@ def compare_read_convergence(h, j, reference, candidate, target_beta=1.0):
     return result
 
 
-def aggregate_gain_metrics(response_records):
-    """Aggregate calibration metrics from response records, never from a summary."""
+def _recompute_response_metrics(record, target_beta=1.0, require_reference_provenance=False):
+    """Recompute VS metrics from frozen files, never from submitted JSON fields."""
+    required = ["source_problem_path", "source_problem_sha256",
+                "reference_sample_path", "reference_sample_sha256",
+                "hardware_matrix_path"]
+    if require_reference_provenance:
+        required.extend(("hardware_matrix_file_sha256", "reference_sampler"))
+    missing = [key for key in required if not record.get(key)]
+    if missing:
+        raise ValueError("VS response lacks frozen metric inputs: %s" % ", ".join(missing))
+    problem_path = resolve_path(record["source_problem_path"])
+    reference_path = resolve_path(record["reference_sample_path"])
+    matrix_path = resolve_path(record["hardware_matrix_path"])
+    if sha256_file(problem_path) != str(record["source_problem_sha256"]):
+        raise ValueError("VS logical h,J source hash mismatch")
+    if sha256_file(reference_path) != str(record["reference_sample_sha256"]):
+        raise ValueError("VS frozen reference sample hash mismatch")
+    if record.get("hardware_matrix_file_sha256") and sha256_file(matrix_path) != str(record["hardware_matrix_file_sha256"]):
+        raise ValueError("VS hardware matrix file hash mismatch")
+    with np.load(problem_path, allow_pickle=False) as problem:
+        h = np.asarray(problem["h"], dtype=np.float64)
+        j = np.asarray(problem["J"], dtype=np.float64)
+    with np.load(matrix_path, allow_pickle=False) as matrix_archive:
+        matrix = np.asarray(matrix_archive["hardware_matrix"])
+    if matrix.shape != (49, 49) or matrix_sha256(matrix) != str(record["matrix_sha256"]):
+        raise ValueError("VS hardware matrix does not match the response identity")
+    response_path = Path(record["response_path"])
+    with np.load(response_path, allow_pickle=False) as response:
+        raw = np.asarray(response["samples"], dtype=np.int8)
+    logical = normalize_hardware_spins(raw, logical_n_bits=h.size)
+    with np.load(reference_path, allow_pickle=False) as reference:
+        reference_samples = np.asarray(reference["samples"], dtype=np.int8)
+        sampler = record.get("reference_sampler")
+        if sampler is None:
+            if require_reference_provenance:
+                raise ValueError("VS response lacks frozen reference sampler provenance")
+            sampler = {}
+        checks = {
+            "backend": sampler.get("backend"),
+            "matrix_space": sampler.get("matrix_space"),
+            "random_seed": sampler.get("seed"),
+            "requested_reads": sampler.get("reads"),
+            "sweeps": sampler.get("sweeps"),
+            "sampler_beta": sampler.get("sampler_beta"),
+            "matrix_beta": sampler.get("matrix_beta"),
+            "hardware_gain": record.get("gain"),
+            "hardware_matrix_sha256": record.get("matrix_sha256"),
+            "source_problem_sha256": record.get("source_problem_sha256"),
+            "instance_id": record.get("instance_id"),
+        }
+        for key, expected in checks.items():
+            if key not in reference:
+                if not require_reference_provenance:
+                    continue
+                raise ValueError("VS reference sample provenance mismatch: %s" % key)
+            actual = np.asarray(reference[key]).reshape(-1)[0].item()
+            if isinstance(expected, (int, float, np.integer, np.floating)):
+                matches = np.isclose(float(actual), float(expected), rtol=0, atol=1e-12)
+            else:
+                matches = str(actual) == str(expected)
+            if not matches:
+                raise ValueError("VS reference sample provenance mismatch: %s" % key)
+    if (reference_samples.shape != (100, h.size)
+            or not np.isin(reference_samples, (-1, 1)).all()):
+        raise ValueError("Frozen VS reference samples have the wrong logical dimension")
+    metrics = compare_response_pair(h, j, reference_samples, logical)
+    metrics["effective_beta_error"] = abs(float(metrics["candidate_beta_eff"]) - float(target_beta))
+    metrics["unique_state_fraction"] = float(metrics["candidate_unique_state_fraction"])
+    result = {key: float(metrics[key]) for key in (
+        "energy_wasserstein", "effective_beta_error", "edge_moment_mae",
+        "magnetization_mae", "unique_state_fraction")}
+    if not np.isfinite(list(result.values())).all():
+        raise ValueError("VS recomputed calibration metrics are non-finite")
+    return result
+
+
+def aggregate_gain_metrics(response_records, recompute=False, prediction_inputs=None,
+                           require_physical=True):
+    """Aggregate calibration metrics; formal paths recompute from raw files."""
     grouped = {}
     for record in response_records:
-        grouped.setdefault(float(record["gain"]), []).append(record)
+        item = dict(record)
+        if recompute:
+            item["recomputed_metrics"] = _recompute_response_metrics(
+                record, require_reference_provenance=prediction_inputs is not None)
+        grouped.setdefault(float(record["gain"]), []).append(item)
     rows = []
     for gain, records in sorted(grouped.items()):
+        metrics = [row.get("recomputed_metrics", row) for row in records]
         rows.append({
             "gain": gain,
             "n_verified_instances": len(records),
-            "energy_wasserstein": float(np.mean([row["energy_wasserstein"] for row in records])),
-            "effective_beta_error": float(np.mean([row["effective_beta_error"] for row in records])),
-            "edge_moment_mae": float(np.mean([row["edge_moment_mae"] for row in records])),
-            "magnetization_mae": float(np.mean([row["magnetization_mae"] for row in records])),
-            "unique_state_fraction": float(np.mean([row["unique_state_fraction"] for row in records])),
+            "energy_wasserstein": float(np.mean([row["energy_wasserstein"] for row in metrics])),
+            "effective_beta_error": float(np.mean([row["effective_beta_error"] for row in metrics])),
+            "edge_moment_mae": float(np.mean([row["edge_moment_mae"] for row in metrics])),
+            "magnetization_mae": float(np.mean([row["magnetization_mae"] for row in metrics])),
+            "unique_state_fraction": float(np.mean([row["unique_state_fraction"] for row in metrics])),
         })
+    if prediction_inputs is not None:
+        from .opsd_vs_selection import recompute_vs_predictions
+        predictions = recompute_vs_predictions(
+            response_records, require_physical=require_physical, **prediction_inputs)
+        for row in rows:
+            daily = [item for item in predictions if item["gain"] == row["gain"]]
+            row["raw_vs_crps"] = float(np.mean([item["metrics"]["CRPS"] for item in daily]))
+            row["vs_prediction_metrics"] = daily
     return rows
+
+
+def prediction_quality_mode(quality_policy):
+    return isinstance(quality_policy, dict) and quality_policy.get("mode") == "engineering_valid_prediction_selection"
+
+
+def choose_vs_candidate(candidate_metrics, quality_policy):
+    """One selection rule shared by gain freezing and TEST revalidation."""
+    if prediction_quality_mode(quality_policy):
+        if not candidate_metrics or any(
+                not np.isfinite(float(row.get("raw_vs_crps", np.nan)))
+                or float(row["raw_vs_crps"]) < 0 for row in candidate_metrics):
+            raise ValueError("Complete finite Raw VS CRPS is required; TEST remains locked")
+        return min(candidate_metrics, key=lambda row: (row["raw_vs_crps"], row["gain"]))
+    qualified = [row for row in candidate_metrics if row.get("quality_status", "pass") == "pass"]
+    if not qualified:
+        raise ValueError("All candidate gains failed the VS quality gate; TEST remains locked")
+    return min(qualified, key=lambda row: (
+        row["energy_wasserstein"], row["effective_beta_error"], row["edge_moment_mae"],
+        row["magnetization_mae"], -row["unique_state_fraction"], row["gain"],
+    ))
 
 
 def select_vs_gain(response_records, output_path, target_beta=1.0,
                    required_gains=None, expected_instances_per_gain=None,
                    expected_instance_ids=None, expected_task_map=None,
                    expected_identity=None, quality_policy=None,
-                   require_physical=True):
+                   require_physical=True, recompute_from_raw=None, prediction_inputs=None):
     """Freeze one gain from verified physical VS records.
 
     Metrics are averaged within each gain across the fixed VS panel. Ties use
@@ -291,10 +404,11 @@ def select_vs_gain(response_records, output_path, target_beta=1.0,
                 raise ValueError("Gain selection requires verified physical VS responses")
         elif record.get("hardware_claim") is not False or record.get("physical_platform_used") is not False:
             raise ValueError("Offline gain selection requires hardware_claim=false")
-        for key in ("energy_wasserstein", "effective_beta_error", "edge_moment_mae",
-                    "magnetization_mae", "unique_state_fraction"):
-            if key not in record:
-                raise ValueError("VS response record lacks %s" % key)
+        if recompute_from_raw is False:
+            for key in ("energy_wasserstein", "effective_beta_error", "edge_moment_mae",
+                        "magnetization_mae", "unique_state_fraction"):
+                if key not in record:
+                    raise ValueError("VS response record lacks %s" % key)
     grouped = {}
     for record in response_records:
         grouped.setdefault(float(record["gain"]), []).append(record)
@@ -304,30 +418,56 @@ def select_vs_gain(response_records, output_path, target_beta=1.0,
         for gain, records in grouped.items():
             if len(records) != int(expected_instances_per_gain):
                 raise ValueError("VS gain %s does not have the required number of verified instances" % gain)
-    candidate_metrics = aggregate_gain_metrics(response_records)
+    raw_fields = ("source_problem_path", "source_problem_sha256",
+                  "reference_sample_path", "reference_sample_sha256",
+                  "hardware_matrix_path")
+    formal_raw_bound = bool(expected_task_map) and any(
+        any(expected.get(field) for field in raw_fields)
+        for expected in expected_task_map.values()
+    )
+    if recompute_from_raw is None:
+        recompute_from_raw = all(all(record.get(field) for field in raw_fields)
+                                 for record in response_records)
+    if required_gains is not None and formal_raw_bound and not recompute_from_raw:
+        raise ValueError("Formal VS gain selection requires raw response metric inputs")
+    if recompute_from_raw is False:
+        for record in response_records:
+            for key in ("energy_wasserstein", "effective_beta_error", "edge_moment_mae",
+                        "magnetization_mae", "unique_state_fraction"):
+                if key not in record:
+                    raise ValueError("VS response record lacks %s" % key)
+    prediction_mode = prediction_quality_mode(quality_policy)
+    if prediction_mode:
+        validate_quality_policy(quality_policy, allow_test_only=not require_physical)
+        if required_gains is None or not recompute_from_raw or prediction_inputs is None:
+            raise ValueError("Prediction selection requires the full VS panel and frozen raw prediction inputs")
+        if set(prediction_inputs) != {"preparation", "protocol"}:
+            raise ValueError("Prediction inputs must not override complete-panel validation")
+        if prediction_inputs["protocol"]["gain_selection"]["quality_gate"] != quality_policy:
+            raise ValueError("Prediction selection policy differs from the frozen protocol")
+    candidate_metrics = aggregate_gain_metrics(
+        response_records, recompute=recompute_from_raw,
+        prediction_inputs=prediction_inputs if prediction_mode else None,
+        require_physical=require_physical)
     if required_gains is not None:
         if not isinstance(quality_policy, dict):
             raise ValueError("No VS quality policy is defined; TEST remains locked")
+        validate_quality_policy(quality_policy, allow_test_only=not require_physical)
         candidate_metrics = evaluate_gain_quality(candidate_metrics, quality_policy)
-        qualified = [row for row in candidate_metrics if row["quality_status"] == "pass"]
-        if not qualified:
-            raise ValueError("All candidate gains failed the VS quality gate; TEST remains locked")
-    else:
-        qualified = candidate_metrics
-    chosen = min(qualified, key=lambda row: (
-        row["energy_wasserstein"], row["effective_beta_error"], row["edge_moment_mae"],
-        row["magnetization_mae"], -row["unique_state_fraction"], row["gain"],
-    ))
+    chosen = choose_vs_candidate(candidate_metrics, quality_policy)
     output_path = Path(output_path)
     if output_path.exists():
         raise FileExistsError("Frozen gain record already exists: %s" % output_path)
     payload = {
         "method_name": "FA-BM-VAE",
+        "artifact_role": "verified_physical_vs_gain_selection" if require_physical else "offline_test_fixture",
         "selection_split": "VS",
         "hardware_claim": bool(require_physical),
         "physical_platform_used": bool(require_physical),
+        "eligible_for_paper": False,
+        "unlock_real_test": bool(require_physical),
         "selected_gain": float(chosen["gain"]),
-        "selection_metric": "lexicographic mean energy Wasserstein, effective-beta error, edge-moment MAE, magnetization MAE, negative unique-state fraction, then lower gain",
+        "selection_metric": "mean Raw VS CRPS, then lower gain" if prediction_mode else "lexicographic mean energy Wasserstein, effective-beta error, edge-moment MAE, magnetization MAE, negative unique-state fraction, then lower gain",
         "selection_metrics": chosen,
         "candidate_metrics": candidate_metrics,
         "immutable": True,
@@ -335,6 +475,8 @@ def select_vs_gain(response_records, output_path, target_beta=1.0,
         "test_data_used": False,
         "verified_vs_records": [dict(row) for row in response_records],
         "n_verified_vs_records": len(response_records),
+        "metrics_source": "raw response samples + frozen logical h,J + frozen reference samples"
+        if recompute_from_raw else "legacy record fields",
     }
     if expected_identity:
         payload.update({key: str(value) for key, value in expected_identity.items()})
@@ -394,8 +536,21 @@ def validate_vs_response_records(response_records, required_gains,
             for field, value in expected_identity.items():
                 if str(record.get(field, "")) != str(value):
                     raise ValueError("VS response provenance does not match frozen %s" % field)
-        if not _finite_metric_record(record):
+        expected_requires_raw = bool(expected and any(
+            expected.get(field) for field in (
+                "source_problem_path", "source_problem_sha256",
+                "reference_sample_path", "reference_sample_sha256",
+                "hardware_matrix_path")
+        ))
+        if not expected_requires_raw and not _finite_metric_record(record):
             raise ValueError("VS response contains a non-finite calibration metric")
+        if expected_requires_raw:
+            try:
+                _recompute_response_metrics(
+                    record, require_reference_provenance=bool(
+                        expected and expected.get("reference_sampler")))
+            except (OSError, KeyError, TypeError, ValueError, IndexError) as exc:
+                raise ValueError("VS response raw metric inputs are invalid") from exc
         if require_quality_policy and quality_policy is None:
             raise ValueError("No VS quality policy is defined; TEST remains locked")
         seen.add(key)
@@ -406,31 +561,79 @@ def validate_vs_response_records(response_records, required_gains,
     return list(response_records)
 
 
+def validate_quality_policy(quality_policy, allow_test_only=False):
+    """Validate approval and finite limits before any paid batch is submitted."""
+    prediction_mode = prediction_quality_mode(quality_policy)
+    approval = "policy_approved" if prediction_mode else "thresholds_approved"
+    if not isinstance(quality_policy, dict) or quality_policy.get("status") != "defined" or quality_policy.get(approval) is not True:
+        raise ValueError("VS quality policy is not approved; TEST remains locked")
+    if quality_policy.get("mode", "legacy_threshold_gate") not in (
+            "legacy_threshold_gate", "engineering_valid_prediction_selection"):
+        raise ValueError("Unknown VS quality policy mode")
+    if quality_policy.get("test_only") and not allow_test_only:
+        raise ValueError("A test-only quality policy cannot authorize physical submission or gain freeze")
+    if not isinstance(quality_policy.get("rule_version"), str) or not quality_policy["rule_version"].strip():
+        raise ValueError("VS quality policy requires a rule_version")
+    if prediction_mode:
+        if (quality_policy.get("selection_metric") != "raw_vs_crps"
+                or quality_policy.get("tie_break") != "lower_gain"
+                or quality_policy.get("diversity_gate_approved") is True):
+            raise ValueError("Prediction policy must use Raw VS CRPS, lower gain ties, and diagnostic diversity")
+    thresholds = quality_policy.get("thresholds")
+    if not isinstance(thresholds, dict):
+        raise ValueError("VS quality policy lacks thresholds")
+    for metric in ("energy_wasserstein", "effective_beta_error", "edge_moment_mae", "magnetization_mae"):
+        try:
+            value = thresholds[metric]
+            valid = not isinstance(value, bool) and np.isfinite(float(value)) and float(value) >= 0.0
+        except (KeyError, TypeError, ValueError, OverflowError):
+            valid = False
+        if not valid:
+            raise ValueError("VS quality threshold must be finite and non-negative: %s" % metric)
+    if quality_policy.get("diversity_gate_approved") is True:
+        try:
+            value = thresholds["unique_state_fraction_min"]
+            valid = not isinstance(value, bool) and np.isfinite(float(value)) and 0.0 <= float(value) <= 1.0
+        except (KeyError, TypeError, ValueError, OverflowError):
+            valid = False
+        if not valid:
+            raise ValueError("Approved diversity threshold must be finite and within [0, 1]")
+    return thresholds
+
+
 def evaluate_gain_quality(candidate_metrics, quality_policy):
     """Recompute gain-level quality from verified response metrics.
 
     ``quality_assessment`` fields supplied by a platform or mock are ignored.
-    Thresholds are intentionally fail-closed until explicitly approved from an
-    independent reference audit.
+    Legacy policies gate on thresholds. Prediction-selection policies retain
+    the same checks as diagnostics only, without certifying distribution fit.
     """
-    if quality_policy.get("status") != "defined" or quality_policy.get("thresholds_approved") is not True:
-        raise ValueError("VS quality thresholds are not approved; TEST remains locked")
-    thresholds = quality_policy.get("thresholds")
-    if not isinstance(thresholds, dict):
-        raise ValueError("VS quality policy lacks thresholds")
+    thresholds = validate_quality_policy(quality_policy, allow_test_only=True)
     error_metrics = ("energy_wasserstein", "effective_beta_error",
                      "edge_moment_mae", "magnetization_mae")
     output = []
     for row in candidate_metrics:
+        if not _finite_metric_record(row):
+            raise ValueError("Non-finite latent diagnostics; TEST remains locked")
         checks = {metric: float(row[metric]) <= float(thresholds[metric])
                   for metric in error_metrics}
-        checks["unique_state_fraction"] = (
-            float(row["unique_state_fraction"]) >= float(thresholds["unique_state_fraction_min"])
-        )
+        diversity_gate = quality_policy.get("diversity_gate_approved") is True
+        checks["unique_state_fraction"] = {
+            "value": float(row["unique_state_fraction"]),
+            "gate_enabled": diversity_gate,
+        }
         item = dict(row)
         item["quality_checks"] = checks
-        item["quality_status"] = "pass" if all(checks.values()) else "fail"
+        item["quality_status"] = "pass" if all(
+            bool(checks[metric]) for metric in error_metrics
+        ) and (not diversity_gate or float(row["unique_state_fraction"]) >= float(
+            thresholds["unique_state_fraction_min"]
+        )) else "fail"
         item["quality_rule_version"] = str(quality_policy["rule_version"])
+        if prediction_quality_mode(quality_policy):
+            item["diagnostic_threshold_status"] = item["quality_status"]
+            item["quality_status"] = "diagnostic_only"
+            item["latent_thresholds_are_hard_gates"] = False
         output.append(item)
     return output
 

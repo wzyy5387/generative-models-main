@@ -14,7 +14,7 @@ from pathlib import Path
 
 import numpy as np
 
-from .kaiwu_13k_protocol import load_protocol
+from .kaiwu_13k_protocol import load_protocol, validate_quality_policy, prediction_quality_mode
 from .kaiwu_adapter import (build_task_name, matrix_sha256,
                              official_task_query_capability,
                              quantize_hardware_matrix, validate_hardware_matrix)
@@ -24,7 +24,8 @@ from .submit_kaiwu_sampling import submit_one
 
 
 ROOT_DIR = Path(__file__).resolve().parents[3]
-DEFAULT_PREPARATION = ROOT_DIR / "export" / "kaiwu_13k_preparation"
+DEFAULT_PREPARATION = ROOT_DIR / "export" / "opsd_sa_negative_kaiwu_preparation_v8"
+DEFAULT_PROTOCOL = ROOT_DIR / "configs" / "paper" / "fa_bm_vae_opsd_sa_negative_kaiwu_protocol.json"
 
 
 def _sha256(path):
@@ -48,13 +49,23 @@ def _validate_preparation_identity(preparation, protocol):
     """Reject a preparation directory built for another protocol/model/data bundle."""
     manifest_path = Path(preparation) / "preparation_manifest.json"
     if not manifest_path.is_file():
+        if prediction_quality_mode(protocol.get("gain_selection", {}).get("quality_gate")):
+            raise FileNotFoundError("New VS quality policy requires a frozen v8 preparation manifest")
         return
     payload = json.loads(manifest_path.read_text(encoding="utf-8"))
+    prediction_mode = prediction_quality_mode(protocol.get("gain_selection", {}).get("quality_gate"))
+    if prediction_mode and payload.get("protocol_version") != protocol.get("protocol_version"):
+        raise RuntimeError("Preparation directory protocol_version does not match protocol JSON")
     protocol_path = resolve_repo_path(protocol.get("_path", "")) if protocol.get("_path") else None
     if protocol_path is not None and protocol_path.is_file():
         expected_protocol_hash = sha256_file(protocol_path)
         if payload.get("protocol_sha256") != expected_protocol_hash:
             raise RuntimeError("Preparation directory was built from a different protocol JSON")
+    if prediction_mode:
+        reference_path = Path(preparation) / "quality_reference_manifest.json"
+        if (not reference_path.is_file()
+                or sha256_file(reference_path) != payload.get("quality_reference_manifest_sha256")):
+            raise RuntimeError("Missing or changed quality_reference_manifest.json")
     expected_model_hash = protocol.get("model", {}).get("checkpoint")
     freeze_path = Path(preparation) / "frozen_model_audit.json"
     if expected_model_hash and freeze_path.is_file():
@@ -69,6 +80,29 @@ def _vs_tasks(preparation, protocol=None):
     gains = (protocol or {}).get("hardware", {}).get("candidate_gains", [125, 150, 200])
     expected_instances = int((protocol or {}).get("vs", {}).get("instances", 10))
     identity = _preparation_identity(preparation, protocol or {})
+    reference_entries = {}
+    reference_manifest = Path(preparation) / "quality_reference_manifest.json"
+    policy = (protocol or {}).get("gain_selection", {}).get("quality_gate", {})
+    prediction_mode = prediction_quality_mode(policy)
+    if prediction_mode and not reference_manifest.is_file():
+        raise FileNotFoundError("New VS quality policy requires quality_reference_manifest.json")
+    if reference_manifest.is_file():
+        payload = json.loads(reference_manifest.read_text(encoding="utf-8"))
+        if prediction_mode and payload.get("protocol_version") != (protocol or {}).get("protocol_version"):
+            raise ValueError("Quality reference manifest protocol_version mismatch")
+        if prediction_mode and payload.get("protocol_sha256") != identity.get("protocol_sha256"):
+            raise ValueError("Quality reference manifest protocol_sha256 mismatch")
+        if prediction_mode and (payload.get("hardware_claim") is not False
+                                or payload.get("physical_platform_used") is not False):
+            raise ValueError("Classical quality references must be explicitly non-physical")
+        reference_entries = {
+            (float(row.get("gain", -1)), str(row["instance_id"])): row
+            for row in payload.get("instances", [])
+        }
+        if len(reference_entries) != len(payload.get("instances", [])):
+            raise ValueError("Quality reference manifest contains duplicate conditions")
+        if prediction_mode and len(reference_entries) != len(gains) * expected_instances:
+            raise ValueError("Quality reference manifest does not cover the full gain-condition panel")
     ids_by_gain = {}
     for gain in gains:
         manifest_path = preparation / ("submission_gain_%d" % gain) / "package" / "submission_manifest.json"
@@ -77,6 +111,10 @@ def _vs_tasks(preparation, protocol=None):
         payload = json.loads(manifest_path.read_text(encoding="utf-8"))
         if payload.get("split") != "VS" or int(payload.get("n_instances", -1)) != expected_instances:
             raise ValueError("VS submission manifest does not match the protocol")
+        if payload.get("protocol_version") != (protocol or {}).get("protocol_version"):
+            raise ValueError("VS submission package protocol_version mismatch")
+        if prediction_mode and payload.get("protocol_sha256") != identity.get("protocol_sha256"):
+            raise ValueError("VS submission package protocol_sha256 mismatch")
         expected_reads = int((protocol or {}).get("hardware", {}).get("reads_per_instance", 100))
         if int(payload.get("requested_reads_per_instance", -1)) != expected_reads:
             raise ValueError("VS submission manifest reads do not match the protocol")
@@ -84,11 +122,63 @@ def _vs_tasks(preparation, protocol=None):
         for item in payload.get("instances", []):
             matrix = manifest_path.parent / item["hardware_matrix"]
             current_ids.append(str(item["instance_id"]))
+            payload_path = manifest_path.parent / item["payload"]
+            platform_payload = json.loads(payload_path.read_text(encoding="utf-8"))
+            if prediction_mode and platform_payload.get("protocol_version") != (protocol or {}).get("protocol_version"):
+                raise ValueError("VS payload protocol_version mismatch")
+            if prediction_mode and platform_payload.get("protocol_sha256") != identity.get("protocol_sha256"):
+                raise ValueError("VS payload protocol_sha256 mismatch")
+            payload_task_name = platform_payload.get("task_name")
+            expected_task_name = build_task_name(
+                item["instance_id"], item["hardware_matrix_sha256"],
+                protocol_id=(protocol or {}).get("protocol_version", ""),
+                stage="vs-calibration", gain=gain,
+            )
+            if payload_task_name != expected_task_name:
+                raise ValueError(
+                    "Frozen VS task_name mismatch for %s: payload=%s expected=%s"
+                    % (item["instance_id"], payload_task_name, expected_task_name)
+                )
             task = {"gain": gain, "manifest": manifest_path, "stage": "vs",
-                          "task_name": (json.loads((manifest_path.parent / item["payload"]).read_text(encoding="utf-8")).get("task_name") if item.get("payload") else None),
+                          "protocol_version": (protocol or {}).get("protocol_version", ""),
+                          "task_name": expected_task_name,
                           "instance_id": item["instance_id"],
                           "matrix": matrix, "matrix_sha256": item["hardware_matrix_sha256"],
+                          "hardware_matrix_path": str(matrix),
+                          "source_problem_path": platform_payload.get("source_problem_path", ""),
+                          "source_problem_sha256": platform_payload.get("source_problem_sha256", ""),
                           "reads": int(payload["requested_reads_per_instance"])}
+            reference = reference_entries.get((float(gain), str(item["instance_id"])), {})
+            if prediction_mode:
+                required_reference = (
+                    "source_problem_path", "source_problem_sha256", "hardware_matrix_path",
+                    "hardware_matrix_file_sha256", "hardware_matrix_sha256",
+                    "reference_sample_path", "reference_sample_sha256", "sampler")
+                if any(not reference.get(key) for key in required_reference):
+                    raise ValueError("Quality reference entry is incomplete for %s" % item["instance_id"])
+                if (reference["source_problem_sha256"] != task["source_problem_sha256"]
+                        or reference["hardware_matrix_sha256"] != item["hardware_matrix_sha256"]
+                        or Path(reference["hardware_matrix_path"]).resolve() != matrix.resolve()
+                        or sha256_file(matrix) != reference["hardware_matrix_file_sha256"]
+                        or sha256_file(resolve_repo_path(reference["source_problem_path"])) != reference["source_problem_sha256"]
+                        or sha256_file(resolve_repo_path(reference["reference_sample_path"])) != reference["reference_sample_sha256"]):
+                    raise ValueError("Quality reference hashes or condition do not match %s" % item["instance_id"])
+                sampler = reference["sampler"]
+                if (sampler.get("backend") != "sa" or sampler.get("matrix_space") != "hardware-quantized"
+                        or int(sampler.get("reads", -1)) != expected_reads
+                        or int(sampler.get("sweeps", -1)) != 100
+                        or int(sampler.get("seed", -1)) != int(
+                            protocol["gain_selection"]["prediction_evaluation"]["noise_seed"]
+                            + item["export_index"]
+                        )):
+                    raise ValueError("Quality reference sampling configuration mismatch")
+                task["hardware_matrix_file_sha256"] = reference["hardware_matrix_file_sha256"]
+                task["reference_sampler"] = sampler
+            task["source_problem_path"] = task["source_problem_path"] or reference.get("source_problem_path", "")
+            task["source_problem_sha256"] = task["source_problem_sha256"] or reference.get("source_problem_sha256", "")
+            task["reference_sample_path"] = reference.get("reference_sample_path", "")
+            task["reference_sample_sha256"] = reference.get("reference_sample_sha256", "")
+            task["requested_reads"] = task["reads"]
             task.update(identity)
             tasks.append(task)
         ids_by_gain[float(gain)] = current_ids
@@ -105,8 +195,11 @@ def _vs_tasks(preparation, protocol=None):
 
 def _task_expected(task):
     return {key: task[key] for key in
-            ("stage", "instance_id", "gain", "matrix_sha256", "requested_reads", "task_name",
-             "protocol_sha256", "model_checkpoint_sha256", "preparation_manifest_sha256")
+            ("protocol_version", "stage", "instance_id", "gain", "matrix_sha256", "requested_reads", "task_name",
+             "protocol_sha256", "model_checkpoint_sha256", "preparation_manifest_sha256",
+             "hardware_matrix_path", "hardware_matrix_file_sha256",
+             "source_problem_path", "source_problem_sha256",
+             "reference_sample_path", "reference_sample_sha256", "reference_sampler")
             if task.get(key) is not None and task.get(key) != ""}
 
 
@@ -145,13 +238,48 @@ def select_pending_tasks(tasks, completed, limit=None):
     return pending if limit is None else pending[:max(0, int(limit))]
 
 
+def _restrict_canary_tasks(tasks, args, protocol):
+    """Restrict the first real probe to one frozen VS condition and gain 125."""
+    if getattr(args, "canary", False) and getattr(args, "confirm_batch", False):
+        raise RuntimeError("Choose canary or batch approval, not both")
+    if getattr(args, "confirm_canary", False) and not getattr(args, "canary", False):
+        raise RuntimeError("--confirm-canary requires --canary")
+    if not getattr(args, "canary", False):
+        return tasks
+    if args.stage != "vs":
+        raise RuntimeError("The canary is restricted to the VS stage")
+    if getattr(args, "canary_instance_id", None) is None:
+        raise RuntimeError("Canary execution requires --canary-instance-id")
+    if getattr(args, "limit", None) != 1:
+        raise RuntimeError("Canary execution requires --limit 1")
+    if args.execute and not getattr(args, "confirm_canary", False):
+        raise RuntimeError("Canary execution requires explicit --confirm-canary")
+    expected_reads = int(protocol.get("hardware", {}).get("reads_per_instance", 100))
+    selected = [item for item in tasks
+                if str(item.get("instance_id")) == str(args.canary_instance_id)
+                and float(item.get("gain")) == 125.0]
+    if len(selected) != 1:
+        raise RuntimeError("Canary condition is not exactly one frozen gain-125 VS task")
+    if int(selected[0]["reads"]) != expected_reads or expected_reads != 100:
+        raise RuntimeError("Canary requires the frozen 100-read VS protocol")
+    return selected
+
+
 def _deterministic_task_name(task, protocol_id):
-    return build_task_name(
+    expected = build_task_name(
         task["instance_id"], task["matrix_sha256"],
         protocol_id=protocol_id,
         stage=("vs-calibration" if task["stage"] == "vs" else "test-evaluation"),
         gain=task["gain"],
     )
+    if task.get("task_name") is None:
+        return expected
+    if task.get("task_name") != expected:
+        raise RuntimeError(
+            "Frozen task_name does not match the protocol-derived task identity: %s != %s"
+            % (task.get("task_name"), expected)
+        )
+    return task["task_name"]
 
 
 def _validated_records_for_tasks(tasks, records):
@@ -213,6 +341,7 @@ def _load_frozen_gain(preparation, protocol=None, allow_offline=False, offline_f
         raise RuntimeError("TEST is locked until verified VS records are listed in the gain freeze")
     if protocol is not None:
         from .kaiwu_13k_protocol import (aggregate_gain_metrics,
+                                         prediction_quality_mode, choose_vs_candidate,
                                          evaluate_gain_quality,
                                          validate_vs_response_records)
         vs_tasks = _vs_tasks(preparation, protocol)
@@ -224,6 +353,7 @@ def _load_frozen_gain(preparation, protocol=None, allow_offline=False, offline_f
                           else protocol.get("gain_selection", {}).get("quality_gate"))
         if not isinstance(quality_policy, dict) or quality_policy.get("status") != "defined":
             raise RuntimeError("TEST is locked until a pre-defined VS quality policy is frozen")
+        validate_quality_policy(quality_policy, allow_test_only=allow_offline)
         validate_vs_response_records(
             verified,
             required_gains=protocol["hardware"]["candidate_gains"],
@@ -236,35 +366,43 @@ def _load_frozen_gain(preparation, protocol=None, allow_offline=False, offline_f
             require_physical=not allow_offline,
         )
         candidate_metrics = payload.get("candidate_metrics")
-        if not isinstance(candidate_metrics, list) or {float(row.get("gain", -1)) for row in candidate_metrics} != set(float(gain) for gain in protocol["hardware"]["candidate_gains"]):
+        if not isinstance(candidate_metrics, list) or len(candidate_metrics) != len(protocol["hardware"]["candidate_gains"]) or {float(row.get("gain", -1)) for row in candidate_metrics} != set(float(gain) for gain in protocol["hardware"]["candidate_gains"]):
             raise RuntimeError("TEST gain freeze lacks the complete candidate metric grid")
         if any(not all(np.isfinite(float(row[key])) for key in
                        ("energy_wasserstein", "effective_beta_error", "edge_moment_mae",
                         "magnetization_mae", "unique_state_fraction"))
                for row in candidate_metrics):
             raise RuntimeError("TEST gain freeze contains non-finite candidate metrics")
+        raw_fields = ("source_problem_path", "source_problem_sha256",
+                      "reference_sample_path", "reference_sample_sha256",
+                      "hardware_matrix_path")
+        recompute_from_raw = all(all(record.get(field) for field in raw_fields)
+                                 for record in verified)
+        prediction_mode = prediction_quality_mode(quality_policy)
+        if prediction_mode and payload.get("quality_gate") != quality_policy:
+            raise RuntimeError("TEST gain freeze quality policy differs from the frozen protocol")
         recomputed = evaluate_gain_quality(
-            aggregate_gain_metrics(verified), quality_policy
-        )
+            aggregate_gain_metrics(verified, recompute=recompute_from_raw,
+                prediction_inputs={"preparation": preparation, "protocol": protocol} if prediction_mode else None,
+                require_physical=not allow_offline), quality_policy)
         for stored, current in zip(candidate_metrics, recomputed):
             for key in ("gain", "n_verified_instances", "energy_wasserstein",
                         "effective_beta_error", "edge_moment_mae",
                         "magnetization_mae", "unique_state_fraction"):
                 if not np.isclose(float(stored[key]), float(current[key]), rtol=0.0, atol=1e-12):
                     raise RuntimeError("TEST gain freeze candidate metrics are not reproducible")
+            if prediction_mode and (not np.isclose(float(stored.get("raw_vs_crps", np.nan)), current["raw_vs_crps"], rtol=0, atol=1e-12)
+                                    or stored.get("vs_prediction_metrics") != current["vs_prediction_metrics"]):
+                raise RuntimeError("TEST gain freeze Raw VS prediction metrics are not reproducible")
         if payload.get("quality_summary_recomputed") is not True:
             raise RuntimeError("TEST gain freeze lacks a recomputed quality summary")
         if any(row.get("quality_status") != recomputed[index].get("quality_status")
                for index, row in enumerate(candidate_metrics)):
             raise RuntimeError("TEST gain freeze quality status is not reproducible")
-        qualified = [row for row in recomputed if row.get("quality_status") == "pass"]
-        if not qualified:
-            raise RuntimeError("All candidate gains failed the VS quality gate; TEST remains locked")
-        chosen = min(qualified, key=lambda row: (
-            float(row["energy_wasserstein"]), float(row["effective_beta_error"]),
-            float(row["edge_moment_mae"]), float(row["magnetization_mae"]),
-            -float(row["unique_state_fraction"]), float(row["gain"]),
-        ))
+        try:
+            chosen = choose_vs_candidate(recomputed, quality_policy)
+        except ValueError as exc:
+            raise RuntimeError(str(exc)) from exc
         if float(payload.get("selected_gain", -1)) != float(chosen["gain"]):
             raise RuntimeError("TEST gain freeze selected gain does not match its candidate metrics")
         for key, value in identity.items():
@@ -336,7 +474,9 @@ def _build_test_manifest(preparation, selected_gain, protocol_id, protocol=None)
     manifest_path = out / "submission_manifest.json"
     if manifest_path.exists():
         existing = json.loads(manifest_path.read_text(encoding="utf-8"))
-        if existing.get("hardware_gain") != float(selected_gain) or existing.get("source_manifest_sha256") != sha256_file(source):
+        if (existing.get("hardware_gain") != float(selected_gain)
+                or existing.get("source_manifest_sha256") != sha256_file(source)
+                or existing.get("protocol_version") != protocol_id):
             raise RuntimeError("Existing TEST manifest is immutable and does not match the frozen gain")
         return manifest_path
     source_items = json.loads(source.read_text(encoding="utf-8"))
@@ -350,7 +490,8 @@ def _build_test_manifest(preparation, selected_gain, protocol_id, protocol=None)
     for item in source_items:
         payload_path = resolve_repo_path(item["platform_payload"])
         payload = json.loads(payload_path.read_text(encoding="utf-8"))
-        if payload.get("instance_id") != item["id"] or item.get("split") != "TEST":
+        if (payload.get("instance_id") != item["id"] or item.get("split") != "TEST"
+                or payload.get("protocol_version") != protocol_id):
             raise RuntimeError("TEST source manifest/payload mismatch")
         h = np.asarray(payload["h"], dtype=float)
         j = np.zeros((h.size, h.size), dtype=float)
@@ -370,6 +511,7 @@ def _build_test_manifest(preparation, selected_gain, protocol_id, protocol=None)
                         "hardware_matrix_file": "hardware_matrices/" + matrix_name,
                         "hardware_matrix_sha256": matrix_sha256(matrix),
                         "hardware_gain": float(selected_gain),
+                        "protocol_version": protocol_id,
                         "hardware_n_bits": 49, "auxiliary_spin_index": 48,
                         "task_name": build_task_name(item["id"], matrix_sha256(matrix),
                                                       protocol_id=protocol_id,
@@ -388,6 +530,7 @@ def _build_test_manifest(preparation, selected_gain, protocol_id, protocol=None)
                         "source_n_edges": int(sum(1 for e in payload.get("couplings", []) if float(e["value"]) != 0)),
                         "max_abs_coefficient": int(np.abs(matrix).max())})
     manifest = {"schema_version": 1, "stage": "test-evaluation", "split": "TEST",
+                "protocol_version": protocol_id,
                 "hardware_claim": False, "physical_platform_used": False,
                 "frozen": True, "hardware_gain": float(selected_gain),
                 "requested_reads_per_instance": expected_reads, "n_instances": len(records),
@@ -422,11 +565,20 @@ def planned_tasks(stage, preparation, output_dir, protocol=None, offline_simulat
 
 def run(args):
     protocol = load_protocol(args.protocol)
-    protocol["_path"] = str(Path(args.protocol).resolve())
-    preparation = Path(args.preparation).resolve()
+    protocol["_path"] = str(Path(args.protocol))
+    preparation = Path(args.preparation)
+    output_dir = Path(args.output_dir)
+    checkpoint_dir = Path(args.checkpoint_dir)
+    if args.execute:
+        if prediction_quality_mode(protocol.get("gain_selection", {}).get("quality_gate")):
+            # Approval changes the protocol hash: freeze it before even the
+            # canary so its response can count toward the same VS panel.
+            validate_quality_policy(protocol["gain_selection"]["quality_gate"])
+        for failure_path in output_dir.glob("**/*.validation_failure.json"):
+            failure = json.loads(failure_path.read_text(encoding="utf-8"))
+            if failure.get("prediction_validation_error"):
+                raise RuntimeError("Prior prediction validation failure requires manual review; no retry or resume: %s" % failure_path)
     _validate_preparation_identity(preparation, protocol)
-    output_dir = Path(args.output_dir).resolve()
-    checkpoint_dir = Path(args.checkpoint_dir).resolve()
     if not hasattr(args, "offline_simulation") and not hasattr(args, "offline_freeze"):
         all_tasks = planned_tasks(args.stage, preparation, output_dir, protocol)
     else:
@@ -435,6 +587,7 @@ def run(args):
             offline_simulation=getattr(args, "offline_simulation", False),
             offline_freeze_path=getattr(args, "offline_freeze", None),
         )
+    all_tasks = _restrict_canary_tasks(all_tasks, args, protocol)
     completed = _load_completed(output_dir, all_tasks) if args.resume else set()
     recovered_records = []
     intents = _load_pending_intents(checkpoint_dir)
@@ -494,6 +647,17 @@ def run(args):
     _validate_execution_limits(tasks)
     if not args.confirm_real_submission or os.environ.get("FA_BM_VAE_RUN_REAL_KAIWU") != "1":
         raise RuntimeError("Real batch requires --confirm-real-submission and FA_BM_VAE_RUN_REAL_KAIWU=1")
+    if not getattr(args, "canary", False):
+        if not getattr(args, "confirm_batch", False):
+            raise RuntimeError("Non-canary submission requires separate --confirm-batch approval")
+        validate_quality_policy(protocol.get("gain_selection", {}).get("quality_gate"))
+    if args.stage == "test" and not getattr(args, "confirm_test", False):
+        raise RuntimeError("TEST execution requires separate explicit --confirm-test approval")
+    if args.stage == "vs" and prediction_quality_mode(protocol.get("gain_selection", {}).get("quality_gate")):
+        from .opsd_vs_selection import recompute_vs_predictions
+        # Zero-response preflight catches missing model/data/reference files
+        # before the first paid request, including the canary.
+        recompute_vs_predictions([], preparation, protocol, require_complete=False)
     project_no = args.project_no or os.environ.get("KAIWU_PROJECT_NO")
     output_dir.mkdir(parents=True, exist_ok=True)
     for item in tasks:
@@ -509,9 +673,46 @@ def run(args):
                             task_name=task_name, stage=args.stage, hardware_gain=item["gain"])
         record = result[2]
         record.update({key: item[key] for key in
-                       ("protocol_sha256", "model_checkpoint_sha256", "preparation_manifest_sha256")
+                       ("protocol_sha256", "model_checkpoint_sha256", "preparation_manifest_sha256",
+                        "protocol_version", "hardware_matrix_path", "hardware_matrix_file_sha256",
+                        "source_problem_path", "source_problem_sha256",
+                        "reference_sample_path", "reference_sample_sha256", "reference_sampler")
                        if item.get(key)})
         record["completed"] = bool(record.get("hardware_claim") and record.get("returned_reads") == item["reads"])
+        expected = dict(_task_expected(item), requested_reads=item["reads"], task_name=task_name)
+        prediction_error = None
+        response_valid = strict_response_record_valid(record, expected)
+        if response_valid and args.stage == "vs" and prediction_quality_mode(protocol.get("gain_selection", {}).get("quality_gate")):
+            from .opsd_vs_selection import recompute_vs_predictions
+            from .kaiwu_13k_protocol import _recompute_response_metrics
+            try:
+                _recompute_response_metrics(record)
+                recompute_vs_predictions([record], preparation, protocol, require_complete=False)
+            except Exception as exc:
+                # A valid spin array with an unusable decoding must not advance
+                # the paid batch. Keep the evidence and pending intent.
+                prediction_error = "%s: %s" % (type(exc).__name__, exc)
+                record["completed"] = False
+                record["prediction_validation_error"] = prediction_error
+                _atomic_json(result[1], record)
+        if not response_valid or prediction_error is not None:
+            # Keep raw files and the pending intent: an unverified paid task
+            # must neither advance the batch nor be automatically resubmitted.
+            failure_path = response_dir / (str(item["instance_id"]) + ".validation_failure.json")
+            _atomic_json(failure_path, {
+                "status": "stopped_invalid_response",
+                "reason": "Submitted response failed strict validation against the frozen task; manual review required",
+                "stage": args.stage, "task_name": task_name,
+                "expected": expected, "response_record": record,
+                "prediction_validation_error": prediction_error,
+                "response_audit_path": str(result[1]),
+                "stopped_at": datetime.now(timezone.utc).isoformat(),
+                "completed": False, "hardware_claim": False, "physical_platform_used": False,
+            })
+            raise RuntimeError(
+                "Submitted response failed strict validation; batch stopped without retry. "
+                "Review the raw response and platform task manually: %s" % failure_path
+            )
         audit_records.append(record)
         validated = _validated_records_for_tasks(all_tasks, audit_records)
         completed_count = len(validated)
@@ -537,7 +738,7 @@ def run(args):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--stage", choices=["vs", "test"], required=True)
-    parser.add_argument("--protocol", type=Path, default=ROOT_DIR / "configs" / "paper" / "fa_bm_vae_kaiwu_13k_protocol.json")
+    parser.add_argument("--protocol", type=Path, default=DEFAULT_PROTOCOL)
     parser.add_argument("--preparation", type=Path, default=DEFAULT_PREPARATION)
     parser.add_argument("--output-dir", type=Path, default=DEFAULT_PREPARATION / "real_responses")
     parser.add_argument("--checkpoint-dir", type=Path, default=DEFAULT_PREPARATION / "checkpoints")
@@ -551,6 +752,16 @@ def main():
                         help="Allow only dry-run planning from non-physical mock freeze records")
     parser.add_argument("--offline-freeze", type=Path, default=None,
                         help="Explicit offline mock freeze; only accepted with --offline-simulation")
+    parser.add_argument("--canary", action="store_true",
+                        help="Restrict to one frozen VS gain-125 condition")
+    parser.add_argument("--confirm-canary", action="store_true",
+                        help="Human approval for the one-task canary; separate from batch approval")
+    parser.add_argument("--confirm-batch", action="store_true",
+                        help="Separate approval for non-canary submission; requires an approved frozen quality policy")
+    parser.add_argument("--confirm-test", action="store_true",
+                        help="Separate explicit approval to submit the frozen TEST stage")
+    parser.add_argument("--canary-instance-id", default=None,
+                        help="Exact frozen VS instance ID used by --canary")
     args = parser.parse_args()
     if args.dry_run and args.execute:
         raise SystemExit("Choose only one of --dry-run and --execute")

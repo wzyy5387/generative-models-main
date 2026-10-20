@@ -15,6 +15,13 @@ from GEFcom2014.models.QBM_VAE.kaiwu_13k_protocol import (
     validate_vs_manifests,
 )
 from GEFcom2014.forecast_quality.compare_scenarios import evaluate_model_daily
+from GEFcom2014.models.QBM_VAE.kaiwu_adapter import build_task_name
+
+
+def test_task_name_canonicalizes_integer_gain_types():
+    args = ("instance", "0123456789abcdef",)
+    common = {"protocol_id": "confirmed-v3", "stage": "vs-calibration"}
+    assert build_task_name(*args, gain=125, **common) == build_task_name(*args, gain=125.0, **common)
 
 
 def _vs_item(gain, index, zone):

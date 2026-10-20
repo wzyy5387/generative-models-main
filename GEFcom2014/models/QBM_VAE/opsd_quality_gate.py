@@ -15,6 +15,7 @@ import numpy as np
 
 from .compare_hardware_responses import compare_response_pair
 from .kaiwu_13k_protocol import (
+    prediction_quality_mode,
     select_vs_gain,
     validate_vs_response_records,
 )
@@ -42,6 +43,8 @@ def sha256_file(path):
 
 def _resolve(path):
     path = Path(path)
+    if path.is_file():
+        return path
     return path if path.is_absolute() else ROOT_DIR / path
 
 
@@ -85,9 +88,6 @@ def _reference_thresholds(rows):
         name: float(np.quantile(values[name], 0.95))
         for name in METRIC_NAMES[:-1]
     }
-    thresholds["unique_state_fraction_min"] = float(
-        np.quantile(values["unique_state_fraction"], 0.05)
-    )
     distributions = {}
     for name, array in values.items():
         distributions[name] = {
@@ -128,15 +128,14 @@ def generate_reference_audit(preparation, output_dir, repeats=5, reads=100,
                     np.savez_compressed(path, samples=samples, hardware_claim=False,
                                         physical_platform_used=False, matrix_space="logical",
                                         gain=gain, repeat=repeat, seed=current_seed)
-            for left in range(repeats):
-                for right in range(left + 1, repeats):
-                    row = compare_response_pair(h, j, float_samples[left], float_samples[right])
-                    row["effective_beta_error"] = abs(float(row["candidate_beta_eff"]) - 1.0)
-                    row["gain"] = gain
-                    row["instance_id"] = instance["id"]
-                    row["repeat_pair"] = [left, right]
-                    row["unique_state_fraction"] = row["candidate_unique_state_fraction"]
-                    null_rows.append(row)
+            for left, right in zip(range(0, repeats - 1, 2), range(1, repeats, 2)):
+                row = compare_response_pair(h, j, float_samples[left], float_samples[right])
+                row["effective_beta_error"] = abs(float(row["candidate_beta_eff"]) - 1.0)
+                row["gain"] = gain
+                row["instance_id"] = instance["id"]
+                row["repeat_pair"] = [left, right]
+                row["unique_state_fraction"] = row["candidate_unique_state_fraction"]
+                null_rows.append(row)
             quant_path = output_dir / "samples" / ("gain_%d" % gain) / "candidate" / (instance["id"] + ".npz")
             quant_path.parent.mkdir(parents=True, exist_ok=True)
             if quant_path.exists():
@@ -159,7 +158,24 @@ def generate_reference_audit(preparation, output_dir, repeats=5, reads=100,
             repeat_manifest.append({"gain": gain, "instance_id": instance["id"],
                                     "float_repeats": repeats, "reads": reads,
                                     "sweeps": sweeps})
-    thresholds, distributions = _reference_thresholds(null_rows)
+    independent_pairs = sorted({tuple(row["repeat_pair"]) for row in null_rows})
+    batch_rows = []
+    for gain in (125, 150, 200):
+        for pair in independent_pairs:
+            rows = [row for row in null_rows
+                    if row["gain"] == gain and tuple(row["repeat_pair"]) == pair]
+            if len(rows) != len(_load_instances(preparation, gain)):
+                raise ValueError("Reference batch does not cover the frozen ten-condition panel")
+            batch_rows.append({
+                "gain": gain,
+                "repeat_pair": list(pair),
+                **{name: float(np.mean([row[name] for row in rows])) for name in METRIC_NAMES},
+            })
+    thresholds, distributions = _reference_thresholds(batch_rows)
+    threshold_stability = []
+    for count in range(2, len(batch_rows) + 1):
+        stable_thresholds, _ = _reference_thresholds(batch_rows[:count])
+        threshold_stability.append({"n_batches": count, "suggested_thresholds": stable_thresholds})
     by_gain = []
     for gain in (125, 150, 200):
         rows = [row for row in candidate_rows if row["gain"] == gain]
@@ -171,15 +187,20 @@ def generate_reference_audit(preparation, output_dir, repeats=5, reads=100,
     report = {
         "artifact_role": "offline_quality_gate_reference_audit",
         "dataset": "OPSD Wind",
-        "preparation_source": str(Path(preparation).resolve()),
+        "preparation_source": str(Path(preparation)),
         "repeats": repeats,
         "reads_per_repeat": reads,
         "sweeps": sweeps,
         "seed_rule": "seed + gain + instance_index*100 + repeat",
-        "independent_reference": "float logical SA repeats; pairwise null distribution",
+        "independent_reference": "float logical SA repeats; disjoint repeat pairs aggregated over all ten VS conditions",
+        "independent_reference_batches": len(batch_rows),
+        "pairwise_rows_not_treated_as_independent": True,
+        "reference_batch_rows": batch_rows,
         "null_distribution": distributions,
         "suggested_thresholds": thresholds,
-        "threshold_basis": "95th percentile for errors and 5th percentile for unique-state fraction from local SA null pairs",
+        "threshold_stability": threshold_stability,
+        "threshold_basis": "95th percentile of gain-level statistics from disjoint local-SA repeat pairs; only four error metrics are threshold candidates",
+        "unique_state_fraction_rule": "diagnostic only; no formal minimum is proposed because repeated states are valid samples",
         "thresholds_approved": False,
         "thresholds_validated_on_physical_platform": False,
         "candidate_gain_metrics": by_gain,
@@ -204,6 +225,12 @@ def make_offline_response_records(preparation, output_dir, protocol, threshold_r
     """Build format-valid, explicitly non-physical mock records for tests."""
     output_dir = Path(output_dir)
     records = []
+    reference_entries = {
+        (float(row["gain"]), str(row["instance_id"])): row
+        for row in json.loads(
+            (Path(preparation) / "quality_reference_manifest.json").read_text(encoding="utf-8")
+        )["instances"]
+    }
     identity = {
         "protocol_sha256": sha256_file(protocol["_path"]),
         "model_checkpoint_sha256": json.loads(
@@ -221,7 +248,9 @@ def make_offline_response_records(preparation, output_dir, protocol, threshold_r
             h, j = _load_logical_problem(instance)
             float_path = output_dir / "samples" / ("gain_%d" % gain) / "repeat_00" / (instance["id"] + ".npz")
             candidate_path = output_dir / "samples" / ("gain_%d" % gain) / "candidate" / (instance["id"] + ".npz")
-            with np.load(float_path) as ref, np.load(candidate_path) as candidate:
+            reference_entry = reference_entries[(float(gain), str(instance["id"]))]
+            reference_path = _resolve(reference_entry["reference_sample_path"])
+            with np.load(reference_path) as ref, np.load(candidate_path) as candidate:
                 ref_samples = np.asarray(ref["samples"], dtype=np.int8)
                 raw = np.asarray(candidate["hardware_samples"], dtype=np.int8)
                 logical = np.asarray(candidate["samples"], dtype=np.int8)
@@ -229,6 +258,9 @@ def make_offline_response_records(preparation, output_dir, protocol, threshold_r
             response_path.parent.mkdir(parents=True, exist_ok=True)
             task_id = "offline-task-%d-%s" % (gain, index)
             package_item = package_items[instance["id"]]
+            problem_path = _resolve(instance["path"])
+            matrix_path = (Path(preparation) / ("submission_gain_%d" % gain) /
+                           "package" / package_item["hardware_matrix"])
             task_name = json.loads(
                 (Path(preparation) / ("submission_gain_%d" % gain) / "package" / package_item["payload"]).read_text(encoding="utf-8")
             )["task_name"]
@@ -244,7 +276,7 @@ def make_offline_response_records(preparation, output_dir, protocol, threshold_r
                 "completed": True, "instance_id": instance["id"], "stage": "vs",
                 "task_id": task_id, "task_name": task_name, "gain": gain,
                 "matrix_sha256": instance["hardware_matrix_sha256"],
-                "response_path": str(response_path.resolve()),
+                "response_path": str(response_path),
                 "response_file_sha256": sha256_file(response_path),
                 "requested_reads": 100, "returned_reads": 100,
                 "sdk_version": "offline-mock", "platform_backend": "offline-mock",
@@ -259,6 +291,13 @@ def make_offline_response_records(preparation, output_dir, protocol, threshold_r
                 "edge_moment_mae": metrics["edge_moment_mae"],
                 "magnetization_mae": metrics["magnetization_mae"],
                 "unique_state_fraction": metrics["candidate_unique_state_fraction"],
+                "hardware_matrix_path": str(matrix_path),
+                "hardware_matrix_file_sha256": sha256_file(matrix_path),
+                "source_problem_path": str(problem_path),
+                "source_problem_sha256": sha256_file(problem_path),
+                "reference_sample_path": str(reference_entry["reference_sample_path"]),
+                "reference_sample_sha256": sha256_file(reference_path),
+                "reference_sampler": reference_entry["sampler"],
                 "quality_assessment": {"status": "forged-and-ignored", "rule_version": "wrong"},
             }
             records.append(record)
@@ -266,17 +305,97 @@ def make_offline_response_records(preparation, output_dir, protocol, threshold_r
 
 
 def run_offline_chain(preparation, output_dir, protocol):
+    if prediction_quality_mode(protocol.get("gain_selection", {}).get("quality_gate")):
+        from .run_kaiwu_13k_sampling import (
+            _preparation_identity, _task_expected, _vs_tasks,
+        )
+        from .kaiwu_13k_protocol import (
+            aggregate_gain_metrics, choose_vs_candidate, evaluate_gain_quality,
+        )
+
+        preparation, output_dir = Path(preparation), Path(output_dir)
+        records = make_offline_response_records(preparation, output_dir, protocol, {})
+        tasks = _vs_tasks(preparation, protocol)
+        expected_ids = sorted({str(task["instance_id"]) for task in tasks})
+        expected_map = {
+            (float(task["gain"]), str(task["instance_id"])): _task_expected(task)
+            for task in tasks
+        }
+        identity = _preparation_identity(preparation, protocol)
+        task_by_key = {(float(task["gain"]), str(task["instance_id"])): task for task in tasks}
+        for record in records:
+            task = task_by_key[(float(record["gain"]), str(record["instance_id"]))]
+            for key, value in task.items():
+                if key not in ("manifest", "matrix"):
+                    record[key] = str(value) if key in identity else value
+            record.update(identity)
+        validated = validate_vs_response_records(
+            records, protocol["hardware"]["candidate_gains"], protocol["vs"]["instances"],
+            expected_instance_ids=expected_ids, expected_task_map=expected_map,
+            expected_identity=identity, require_quality_policy=False,
+            require_physical=False)
+
+        # Approve only an in-memory test fixture so the complete new rule can
+        # be exercised offline. The persisted protocol remains unapproved.
+        fixture_policy = dict(protocol["gain_selection"]["quality_gate"])
+        fixture_policy.update(status="defined", policy_approved=True, test_only=True)
+        candidate_metrics = aggregate_gain_metrics(
+            validated, recompute=True,
+            prediction_inputs={"preparation": preparation, "protocol": protocol},
+            require_physical=False)
+        candidate_metrics = evaluate_gain_quality(candidate_metrics, fixture_policy)
+        chosen = choose_vs_candidate(candidate_metrics, fixture_policy)
+        report_path = output_dir / "offline_prediction_policy_validation.json"
+        if report_path.exists():
+            raise FileExistsError("Offline prediction validation report already exists: %s" % report_path)
+        report = {
+            "artifact_role": "offline_test_fixture",
+            "policy_validation": "passed_offline_fixture_only",
+            "protocol_version": protocol["protocol_version"],
+            **identity,
+            "quality_reference_manifest_sha256": sha256_file(
+                preparation / "quality_reference_manifest.json"),
+            "selection_split": "VS",
+            "selected_gain_diagnostic_only": float(chosen["gain"]),
+            "selection_metric": "mean Raw VS CRPS, then lower gain",
+            "candidate_metrics": candidate_metrics,
+            "response_records": len(validated),
+            "hardware_claim": False,
+            "physical_platform_used": False,
+            "eligible_for_paper": False,
+            "unlock_real_test": False,
+            "protocol_policy_mutated": False,
+            "test_data_used": False,
+            "test_peeking": False,
+            "note": "Offline local-SA fixture validates code-path behavior only; it is not a physical VS panel, gain freeze, hardware result, or TEST authorization.",
+        }
+        report_path.parent.mkdir(parents=True, exist_ok=True)
+        report_path.write_text(json.dumps(report, indent=2), encoding="utf-8")
+        audit_path = output_dir / "offline_chain_audit.json"
+        audit_path.write_text(json.dumps({
+            "artifact_role": "offline_test_fixture",
+            "new_prediction_policy_validation": "passed_offline_fixture_only",
+            "report": str(report_path),
+            "hardware_claim": False,
+            "physical_platform_used": False,
+            "eligible_for_paper": False,
+            "unlock_real_test": False,
+            "test_data_used": False,
+            "test_peeking": False,
+            "test_only_policy_approval_was_in_memory": True,
+        }, indent=2), encoding="utf-8")
+        return report
     audit = json.loads((Path(output_dir) / "quality_gate_reference_audit.json").read_text(encoding="utf-8"))
     records = make_offline_response_records(preparation, output_dir, protocol, audit)
     identity = {key: records[0][key] for key in
                 ("protocol_sha256", "model_checkpoint_sha256", "preparation_manifest_sha256")}
-    approved = {"status": "defined", "rule_version": "offline-test-only-v1",
+    suggested = audit.get("suggested_thresholds", {})
+    approved = {"status": "defined", "rule_version": "offline-test-only-v2",
                 "thresholds_approved": True, "test_only": True,
-                "thresholds": {"energy_wasserstein": 10.0,
-                               "effective_beta_error": 10.0,
-                               "edge_moment_mae": 10.0,
-                               "magnetization_mae": 10.0,
-                               "unique_state_fraction_min": 0.0}}
+                "thresholds": {key: float(suggested[key]) for key in (
+                    "energy_wasserstein", "effective_beta_error",
+                    "edge_moment_mae", "magnetization_mae")},
+                "diversity_gate_approved": False}
     expected_ids = sorted({row["instance_id"] for row in records})
     validated = validate_vs_response_records(
         records, (125, 150, 200), 10, expected_instance_ids=expected_ids,
@@ -285,7 +404,8 @@ def run_offline_chain(preparation, output_dir, protocol):
     payload = select_vs_gain(
         validated, freeze_path, required_gains=(125, 150, 200),
         expected_instances_per_gain=10, expected_instance_ids=expected_ids,
-        quality_policy=approved, expected_identity=identity, require_physical=False)
+        quality_policy=approved, expected_identity=identity, require_physical=False,
+        recompute_from_raw=True)
     payload["artifact_role"] = "offline_simulation"
     payload["hardware_claim"] = False
     payload["physical_platform_used"] = False
@@ -293,8 +413,9 @@ def run_offline_chain(preparation, output_dir, protocol):
     (Path(output_dir) / "offline_chain_audit.json").write_text(json.dumps({
         "format_validation": "passed with physical flags false",
         "quality_recomputed": True,
+        "quality_policy_source": "local-SA reference suggestion; test-only fixture, not protocol approval",
         "forged_quality_field_used": False,
-        "freeze_written": str(freeze_path.resolve()),
+        "freeze_written": str(freeze_path),
         "test_dry_run": "prepared only; no SDK call",
         "hardware_claim": False,
         "physical_platform_used": False,
@@ -306,7 +427,7 @@ def parse_args():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--preparation", type=Path, required=True)
     parser.add_argument("--output-dir", type=Path, required=True)
-    parser.add_argument("--repeats", type=int, default=5)
+    parser.add_argument("--repeats", type=int, default=10)
     parser.add_argument("--reads", type=int, default=100)
     parser.add_argument("--sweeps", type=int, default=100)
     parser.add_argument("--seed", type=int, default=202600)
