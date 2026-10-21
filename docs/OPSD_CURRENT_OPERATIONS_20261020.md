@@ -18,7 +18,7 @@ This is the current status note for OPSD SA-negative hardware preparation and th
 
 `export/opsd_sa_matched_random_graph_v1/formal_task_manifest.json` contains six commands with disjoint output paths: `formal/temporal/seed_N/` and `formal/random/seed_N/`, `N=0,1,2`. The two configs use distinct run labels. Every command checks that its output directory is absent before execution. If a path exists later, identity verification and separate confirmation are required before recovery.
 
-The random graph is one preregistered topology generated with graph seed 20261020. The three training seeds share this same topology; they are not three independent random graphs and cannot support a claim of superiority over the random-graph population. Training seeds are 0/1/2, graph seed is 20261020, and paired generation seeds are 0/1/2. The completed two-epoch, five-scenario VS run was a short functional check only. All six formal training jobs are **NOT RUN**. Real hardware experiments are also **NOT RUN**.
+The random graph is one preregistered topology generated with graph seed 20261020. The three training seeds share this same topology; they are not three independent random graphs and cannot support a claim of superiority over the random-graph population. Training seeds are 0/1/2, graph seed is 20261020, and paired generation seeds are 0/1/2. The completed two-epoch, five-scenario VS run was a short functional check only. The six formal training jobs are completed; real hardware experiments are still **NOT RUN**.
 
 Frozen topology evaluation: Raw Ramp CRPS and Variogram are primary; Raw CRPS, Energy, coverage, and bias are secondary; ECC is excluded from primary topology attribution. Report date-level results and retain both arms by seed.
 
@@ -34,7 +34,7 @@ Read-only inspection recorded distribution version `1.4.1` and imported module v
 | v8 identity and local zero-response preflight | See independent audit report |
 | Single-task canary dry-run, VS / gain 125 / 100 reads | See independent audit report; dry-run only, no SDK submission |
 | Real canary and real VS | **NOT RUN**, requires separate user authorization and external account/billing checks |
-| Formal matched-topology training (six jobs) | **NOT RUN**, requires separate user authorization |
+| Formal matched-topology training (six jobs) | **COMPLETED 6/6**, VS-only |
 | TEST sampling or new TEST metrics | **NOT RUN**; TEST remains locked |
 
 Audit reports are stored under a fresh `export/opsd_zero_credit_acceptance_*` directory; they do not modify v8 or topology artifacts.
@@ -67,3 +67,7 @@ The reproducible task-level provenance is in
 `export/opsd_sa_matched_random_graph_v1/formal_task_manifest_v2.json`; the
 handoff report and numerical summary are in
 `export/opsd_sa_matched_random_graph_v1/formal_vs_evaluation/TOPOLOGY_HANDOFF_REPORT.md`.
+The manifest top-level status is now `COMPLETED 6/6`; its original runtime
+commit/source hashes are retained separately from the post-hoc statistics
+archive at
+`export/opsd_sa_matched_random_graph_v1/formal_vs_evaluation_v2/`.

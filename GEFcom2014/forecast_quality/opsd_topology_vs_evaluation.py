@@ -6,6 +6,8 @@ import csv
 import hashlib
 import json
 import platform
+import shutil
+import subprocess
 import sys
 from pathlib import Path
 
@@ -38,6 +40,9 @@ METRICS = (
     "interval_width90",
     "bias",
 )
+BOOTSTRAP_BLOCK_DAYS = 7
+BOOTSTRAP_REPETITIONS = 5000
+BOOTSTRAP_SEED = 20261020
 
 
 def sha256_file(path):
@@ -84,35 +89,67 @@ def _write_csv(path, rows):
         writer.writerows(rows)
 
 
-def _block_means(values, block_size=7):
+def _time_blocks(values, block_size=BOOTSTRAP_BLOCK_DAYS):
     values = np.asarray(values, dtype=np.float64)
-    return np.asarray(
-        [values[start:start + block_size].mean()
-         for start in range(0, values.size, block_size)],
-        dtype=np.float64,
-    )
+    if values.ndim != 1 or values.size == 0:
+        raise ValueError("bootstrap values must be a non-empty one-dimensional array")
+    if block_size <= 0:
+        raise ValueError("block_size must be positive")
+    return [values[start:start + block_size]
+            for start in range(0, values.size, block_size)]
 
 
-def _paired_block_summary(per_date, repetitions=5000, seed=20261020):
+def _cross_seed_difference(per_date, metric):
+    """Return one paired difference per common forecast date.
+
+    The three training seeds are repeated measurements of the same date. The
+    bootstrap unit is therefore the cross-seed daily mean, not a seed-specific
+    block or an individual scenario read.
+    """
+    differences = []
+    for seed_id in SEEDS:
+        temporal = np.asarray(per_date["temporal"][seed_id][metric], dtype=np.float64)
+        random = np.asarray(per_date["random"][seed_id][metric], dtype=np.float64)
+        if temporal.ndim != 1 or random.ndim != 1 or temporal.shape != random.shape:
+            raise ValueError("temporal/random date arrays must have identical one-dimensional shapes")
+        differences.append(temporal - random)
+    lengths = {values.size for values in differences}
+    if len(lengths) != 1:
+        raise ValueError("all seeds must share the same forecast-date set")
+    return np.mean(np.stack(differences, axis=0), axis=0)
+
+
+def _weighted_block_bootstrap(values, repetitions, rng, block_size=BOOTSTRAP_BLOCK_DAYS):
+    """Bootstrap non-overlapping time blocks with date-proportional weights.
+
+    The last 6-day block is sampled with probability 6/90, not as one of 13
+    equally likely blocks. This keeps the bootstrap target equal to the daily
+    mean while retaining contiguous time blocks.
+    """
+    blocks = _time_blocks(values, block_size)
+    lengths = np.asarray([block.size for block in blocks], dtype=np.float64)
+    probabilities = lengths / lengths.sum()
+    draws = np.empty(int(repetitions), dtype=np.float64)
+    for index in range(draws.size):
+        selected = rng.choice(len(blocks), size=len(blocks), replace=True, p=probabilities)
+        draws[index] = np.mean([blocks[item].mean() for item in selected])
+    return draws, lengths
+
+
+def _paired_block_summary(
+    per_date,
+    repetitions=BOOTSTRAP_REPETITIONS,
+    seed=BOOTSTRAP_SEED,
+    block_size=BOOTSTRAP_BLOCK_DAYS,
+):
     rng = np.random.default_rng(seed)
     rows = []
     for metric in METRICS:
-        block_arrays = []
-        observed_values = []
-        for seed_id in SEEDS:
-            difference = (
-                per_date["temporal"][seed_id][metric]
-                - per_date["random"][seed_id][metric]
-            )
-            block_arrays.append(_block_means(difference, 7))
-            observed_values.extend(difference.tolist())
-        bootstrap = np.empty(repetitions, dtype=np.float64)
-        for index in range(repetitions):
-            bootstrap[index] = np.mean([
-                blocks[rng.integers(0, blocks.size, size=blocks.size)].mean()
-                for blocks in block_arrays
-            ])
-        observed = float(np.mean(observed_values))
+        daily_difference = _cross_seed_difference(per_date, metric)
+        bootstrap, block_lengths = _weighted_block_bootstrap(
+            daily_difference, repetitions, rng, block_size=block_size
+        )
+        observed = float(np.mean(daily_difference))
         rows.append({
             "contrast": "temporal_minus_random",
             "metric": metric,
@@ -120,15 +157,138 @@ def _paired_block_summary(per_date, repetitions=5000, seed=20261020):
             "ci_2.5": float(np.quantile(bootstrap, 0.025)),
             "ci_97.5": float(np.quantile(bootstrap, 0.975)),
             "n_seeds": len(SEEDS),
-            "n_date_blocks_per_seed": int(block_arrays[0].size),
-            "bootstrap_block_days": 7,
+            "n_dates": int(daily_difference.size),
+            "n_date_blocks": int(block_lengths.size),
+            "date_block_lengths": ";".join(str(int(length)) for length in block_lengths),
+            "tail_block_days": int(block_lengths[-1]),
+            "bootstrap_block_days": int(block_size),
+            "bootstrap_method": "cross_seed_daily_mean_weighted_nonoverlap_blocks",
+            "bootstrap_seed": int(seed),
+            "bootstrap_repetitions": int(repetitions),
         })
     return rows
 
 
-def evaluate(args):
+def _read_existing_daily_metrics(path):
+    """Read and validate an existing VS daily-metric artifact without reloading scenarios."""
+    path = Path(path)
+    with path.open("r", newline="", encoding="utf-8") as handle:
+        rows = list(csv.DictReader(handle))
+    expected = {(arm, seed, day) for arm in ARMS for seed in SEEDS for day in range(90)}
+    records = {}
+    for row in rows:
+        key = (row.get("arm"), int(row.get("seed", -1)), int(row.get("date_index", -1)))
+        if key in records or key not in expected:
+            raise ValueError("existing daily metrics contain duplicate or unexpected date keys")
+        record = {}
+        for metric in METRICS:
+            if metric not in row:
+                raise ValueError("existing daily metrics missing %s" % metric)
+            value = float(row[metric])
+            if not np.isfinite(value):
+                raise ValueError("existing daily metrics contain non-finite values")
+            record[metric] = value
+        records[key] = record
+    actual = set(records)
+    if actual != expected:
+        raise ValueError("existing daily metrics do not contain exactly 90 common dates per arm/seed")
+    per_date = {arm: {seed: {} for seed in SEEDS} for arm in ARMS}
+    for arm in ARMS:
+        for seed in SEEDS:
+            for metric in METRICS:
+                values = np.asarray(
+                    [records[(arm, seed, day)][metric] for day in range(90)],
+                    dtype=np.float64,
+                )
+                if values.shape != (90,) or not np.isfinite(values).all():
+                    raise ValueError("existing daily metrics are incomplete or non-finite")
+                per_date[arm][seed][metric] = values
+    return rows, per_date
+
+
+def _git_commit():
+    try:
+        return subprocess.run(
+            ["git", "rev-parse", "HEAD"], capture_output=True, text=True, check=True
+        ).stdout.strip()
+    except (OSError, subprocess.CalledProcessError):
+        return None
+
+
+def _git_dirty():
+    try:
+        return bool(subprocess.run(
+            ["git", "status", "--porcelain"], capture_output=True, text=True, check=True
+        ).stdout.strip())
+    except (OSError, subprocess.CalledProcessError):
+        return None
+
+
+def _posthoc_recompute_summary(args):
+    """Recompute only the paired VS interval from an existing daily artifact."""
+    source_dir = Path(args.source_evaluation_dir)
     output_dir = Path(args.output_dir)
-    output_dir.mkdir(parents=True, exist_ok=True)
+    source_daily = source_dir / "per_date_metrics.csv"
+    source_seed = source_dir / "per_seed_metrics.csv"
+    source_summary = source_dir / "arm_summary.csv"
+    required = (source_daily, source_seed, source_summary)
+    if not all(path.is_file() for path in required):
+        raise FileNotFoundError("source evaluation directory is incomplete")
+    daily_rows, per_date = _read_existing_daily_metrics(source_daily)
+    # Atomically reserve a new output directory; never overwrite an existing run.
+    output_dir.mkdir(parents=True, exist_ok=False)
+    for source_path in required:
+        shutil.copyfile(source_path, output_dir / source_path.name)
+    _write_csv(
+        output_dir / "paired_temporal_minus_random_7day.csv",
+        _paired_block_summary(per_date),
+    )
+    bundle = Path(args.dataset_bundle)
+    provenance = {
+        "artifact_role": "posthoc_recomputed_vs_summary",
+        "eligible_for_paper": True,
+        "smoke_only": False,
+        "synthetic_data": False,
+        "hardware_claim": False,
+        "physical_platform_used": False,
+        "test_read": False,
+        "source_evaluation_dir": str(source_dir.resolve()),
+        "source_daily_metrics_sha256": sha256_file(source_daily),
+        "source_seed_metrics_sha256": sha256_file(source_seed),
+        "source_arm_summary_sha256": sha256_file(source_summary),
+        "source_daily_rows": len(daily_rows),
+        "recomputed_from_existing_daily_metrics": True,
+        "scenarios_reloaded": False,
+        "dataset": str(bundle.resolve()),
+        "dataset_sha256": sha256_file(bundle),
+        "split": "VS",
+        "arms": list(ARMS),
+        "seeds": list(SEEDS),
+        "metrics": list(METRICS),
+        "bootstrap_block_days": BOOTSTRAP_BLOCK_DAYS,
+        "bootstrap_repetitions": BOOTSTRAP_REPETITIONS,
+        "bootstrap_seed": BOOTSTRAP_SEED,
+        "bootstrap_target": "cross-seed daily paired mean",
+        "bootstrap_date_weighting": "daily mean; block draw probability proportional to block length",
+        "source_git_commit": _git_commit(),
+        "source_git_dirty": _git_dirty(),
+        "evaluator_sha256": sha256_file(Path(__file__)),
+        "command": " ".join(sys.argv),
+        "python": sys.version,
+        "platform": platform.platform(),
+    }
+    (output_dir / "provenance.json").write_text(
+        json.dumps(provenance, indent=2), encoding="utf-8"
+    )
+    print("Wrote post-hoc VS summary to %s" % output_dir)
+
+
+def evaluate(args):
+    if args.source_evaluation_dir is not None:
+        return _posthoc_recompute_summary(args)
+    output_dir = Path(args.output_dir)
+    # Atomically reserve a new output directory; never overwrite an existing run.
+    output_dir.mkdir(parents=True, exist_ok=False)
     bundle = Path(args.dataset_bundle)
     targets = load_targets("opsd-wind", "VS", bundle)
     per_date = {arm: {} for arm in ARMS}
@@ -147,6 +307,14 @@ def evaluate(args):
         "seeds": list(SEEDS),
         "scenario_count": 100,
         "metrics": list(METRICS),
+        "bootstrap_block_days": BOOTSTRAP_BLOCK_DAYS,
+        "bootstrap_repetitions": BOOTSTRAP_REPETITIONS,
+        "bootstrap_seed": BOOTSTRAP_SEED,
+        "bootstrap_target": "cross-seed daily paired mean",
+        "bootstrap_date_weighting": "daily mean; block draw probability proportional to block length",
+        "git_commit": _git_commit(),
+        "git_dirty": _git_dirty(),
+        "evaluator_sha256": sha256_file(Path(__file__)),
         "command": " ".join(sys.argv),
         "python": sys.version,
         "platform": platform.platform(),
@@ -227,6 +395,13 @@ def parse_args():
         "--output-dir",
         type=Path,
         default=ROOT_DIR / "export" / "opsd_sa_matched_random_graph_v1" / "formal_vs_evaluation",
+        help="New output directory; existing paths are rejected without overwriting results",
+    )
+    parser.add_argument(
+        "--source-evaluation-dir",
+        type=Path,
+        default=None,
+        help="Recompute only the paired VS summary from an existing daily-metric artifact",
     )
     return parser.parse_args()
 

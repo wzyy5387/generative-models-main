@@ -1,5 +1,5 @@
+import json
 import sys
-from pathlib import Path
 
 import numpy as np
 import pytest
@@ -137,18 +137,31 @@ def test_legacy_generation_seed_metadata_remains_backward_compatible():
     assert metadata["generation_split_seeds"] is None
 
 
-@pytest.mark.parametrize("config_name,label", [
-    ("temporal_graph_config.json", "matched_temporal"),
-    ("matched_random_graph_config.json", "matched_random"),
-])
-def test_matched_graph_configs_accept_fixed_generation_policy(monkeypatch, config_name, label):
-    config = (
-        Path(__file__).resolve().parents[1]
-        / "export" / "opsd_sa_matched_random_graph_v1" / config_name
-    )
+@pytest.mark.parametrize("label", ["matched_temporal", "matched_random"])
+def test_minimal_graph_config_accepts_fixed_generation_policy(monkeypatch, tmp_path, label):
+    config = tmp_path / (label + ".json")
+    config.write_text(json.dumps({
+        "run_label": label,
+        "sampler": "sa",
+        "scenario_splits": ["VS"],
+        "n_scenarios": 100,
+        "generation_split_seed_offsets": {"VS": 0, "TEST": 1000003},
+        "generation_sa_settings": {
+            "sweeps": 200,
+            "beta_start": 0.1,
+            "constructor_beta_end": 2.0,
+            "beta_argument": 1.0,
+            "effective_beta_end": 1.0,
+        },
+        "generation_observation_noise": True,
+        "generation_day_batch_size": 50,
+    }), encoding="utf-8")
     monkeypatch.setattr(sys, "argv", ["qbm_vae", "--config", str(config)])
     args = parse_args()
     assert args.run_label == label
+    assert args.sampler == "sa"
+    assert args.scenario_splits == ["VS"]
+    assert args.n_scenarios == 100
     assert args.generation_seed is None
 
 
