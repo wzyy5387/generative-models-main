@@ -230,7 +230,7 @@ def sample_ddpm(model, scheduler, context, data_dim, n_scenarios, inference_step
     return np.concatenate(chunks, axis=0)
 
 
-def sample_residual_bootstrap(raw_arrays, split, n_scenarios, seed):
+def sample_residual_bootstrap(raw_arrays, split, n_scenarios, seed, clip_range=(0.0, 1.0)):
     """Add LS forecast-error days to each supplied day-ahead point forecast."""
     data_dim = raw_arrays["y_ls"].shape[1]
     if raw_arrays["x_ls"].shape[1] < data_dim:
@@ -242,7 +242,9 @@ def sample_residual_bootstrap(raw_arrays, split, n_scenarios, seed):
         0, residual_days.shape[0], size=(forecast.shape[0], n_scenarios)
     )
     samples = forecast[:, None, :] + residual_days[indices]
-    return np.clip(samples, 0.0, 1.0).astype(np.float32)
+    if clip_range is not None:
+        samples = np.clip(samples, clip_range[0], clip_range[1])
+    return samples.astype(np.float32)
 
 
 def prepare_track(tag):
@@ -282,7 +284,8 @@ def scenarios_to_period_matrix(samples, scaler, tag, zero_indices):
     flat = scaler.inverse_transform(samples.reshape(-1, data_dim)).reshape(
         n_days, n_scenarios, data_dim
     )
-    flat = np.clip(flat, 0.0, 1.0)
+    if tag != "neso-wind":
+        flat = np.clip(flat, 0.0, 1.0)
     if tag == "pv":
         rebuilt = np.zeros((n_days, n_scenarios, 24), dtype=np.float64)
         non_zero = np.setdiff1d(np.arange(24), zero_indices)
@@ -329,6 +332,8 @@ def parse_args():
     parser.add_argument("--grad-clip", type=float, default=5.0)
     parser.add_argument("--n-scenarios", type=int, default=100)
     parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument("--generation-seed", type=int, default=None)
+    parser.add_argument("--scenario-splits", nargs="+", choices=["VS", "TEST"], default=["VS", "TEST"])
     parser.add_argument("--device", default="auto", choices=["auto", "cpu", "cuda"])
     parser.add_argument("--output-dir", type=Path, default=None)
     parser.add_argument("--num-transforms", type=int, default=5)
@@ -340,6 +345,7 @@ def parse_args():
 
 def main():
     args = parse_args()
+    generation_seed = args.seed if args.generation_seed is None else args.generation_seed
     set_seed(args.seed)
     if args.device == "auto":
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -361,14 +367,13 @@ def main():
         output_dir.mkdir(parents=True, exist_ok=True)
         label = MODEL_LABELS[args.model]
         model_name = "%s_%s_%s" % (args.tag, label, args.seed)
-        samples_by_split = {
-            "VS": sample_residual_bootstrap(
-                raw_arrays, "vs", args.n_scenarios, args.seed + 15485863
-            ),
-            "TEST": sample_residual_bootstrap(
-                raw_arrays, "test", args.n_scenarios, args.seed + 32452843
-            ),
-        }
+        samples_by_split = {}
+        for split, offset in (("VS", 15485863), ("TEST", 32452843)):
+            if split in args.scenario_splits:
+                samples_by_split[split] = sample_residual_bootstrap(
+                    raw_arrays, split.lower(), args.n_scenarios, generation_seed + offset,
+                    clip_range=None if args.tag == "neso-wind" else (0.0, 1.0),
+                )
         with (output_dir / (model_name + ".json")).open("w", encoding="utf-8") as handle:
             arguments = {
                 key: str(value) if isinstance(value, Path) else value
@@ -406,8 +411,13 @@ def main():
             data_dim, context_dim, args.hidden_dim, args.num_transforms, args.num_bins
         ).to(device)
         history, _ = train_spline_flow(model, arrays, args, device)
-        validation_samples = sample_spline_flow(model, arrays["x_vs"], args.n_scenarios, device)
-        test_samples = sample_spline_flow(model, arrays["x_test"], args.n_scenarios, device)
+        samples_by_split = {}
+        if "VS" in args.scenario_splits:
+            torch.manual_seed(generation_seed + 104729)
+            samples_by_split["VS"] = sample_spline_flow(model, arrays["x_vs"], args.n_scenarios, device)
+        if "TEST" in args.scenario_splits:
+            torch.manual_seed(generation_seed + 130363)
+            samples_by_split["TEST"] = sample_spline_flow(model, arrays["x_test"], args.n_scenarios, device)
     else:
         scheduler = DDPMScheduler(
             num_train_timesteps=args.diffusion_steps,
@@ -417,14 +427,19 @@ def main():
         )
         model = ConditionalDenoiser(data_dim, context_dim, args.hidden_dim).to(device)
         history, _ = train_ddpm(model, scheduler, arrays, args, device)
-        validation_samples = sample_ddpm(
-            model, scheduler, arrays["x_vs"], data_dim, args.n_scenarios,
-            args.inference_steps, device,
-        )
-        test_samples = sample_ddpm(
-            model, scheduler, arrays["x_test"], data_dim, args.n_scenarios,
-            args.inference_steps, device,
-        )
+        samples_by_split = {}
+        if "VS" in args.scenario_splits:
+            torch.manual_seed(generation_seed + 104729)
+            samples_by_split["VS"] = sample_ddpm(
+                model, scheduler, arrays["x_vs"], data_dim, args.n_scenarios,
+                args.inference_steps, device,
+            )
+        if "TEST" in args.scenario_splits:
+            torch.manual_seed(generation_seed + 130363)
+            samples_by_split["TEST"] = sample_ddpm(
+                model, scheduler, arrays["x_test"], data_dim, args.n_scenarios,
+                args.inference_steps, device,
+            )
 
     model_name = "%s_%s_%s" % (args.tag, label, args.seed)
     torch.save(model.state_dict(), output_dir / (model_name + ".pt"))
@@ -437,7 +452,7 @@ def main():
     with (output_dir / (model_name + "_scaler.pickle")).open("wb") as handle:
         pickle.dump(target_scaler, handle)
 
-    for split, samples in (("VS", validation_samples), ("TEST", test_samples)):
+    for split, samples in samples_by_split.items():
         scenarios = scenarios_to_period_matrix(samples, target_scaler, args.tag, zero_indices)
         path = output_dir / (
             "scenarios_%s_%s_%s_%s_%s.pickle" % (

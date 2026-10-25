@@ -27,6 +27,32 @@ MIN_SAMPLING_READS = 10
 MAX_SAMPLING_READS = 2000
 
 
+class KaiwuResponseError(RuntimeError):
+    """An SDK returned a response that failed validation; retain raw values."""
+
+    def __init__(self, message, raw_samples, task_name):
+        super().__init__(message)
+        self.raw_samples = raw_samples
+        self.task_name = task_name
+
+
+def validate_raw_hardware_spins(samples, num_reads, n_bits):
+    """Validate SDK values before narrowing or converting their dtype."""
+    raw = np.asarray(samples)
+    if raw.ndim != 2 or raw.shape != (num_reads, n_bits):
+        raise ValueError(
+            "Kaiwu returned samples with shape %s; expected (%d, %d)"
+            % (raw.shape, num_reads, n_bits)
+        )
+    if (not np.issubdtype(raw.dtype, np.number)
+            or np.issubdtype(raw.dtype, np.complexfloating)
+            or not np.isfinite(raw).all()):
+        raise ValueError("Kaiwu returned non-numeric or non-finite samples")
+    if not np.isin(raw, (-1, 1)).all():
+        raise ValueError("Kaiwu returned values outside {-1,+1}")
+    return raw.astype(np.int8, copy=False)
+
+
 def kaiwu_sdk_versions(kaiwu_module=None):
     """Return both distribution and imported-module Kaiwu versions."""
     try:
@@ -279,29 +305,24 @@ class KaiwuClient:
             task_mode=self._task_mode.SAMPLING,
             sample_number=num_reads,
         )
-        samples = np.asarray(
-            optimizer.solve(
+        raw_samples = optimizer.solve(
                 matrix,
                 negtail_flip=False,
                 sort_solutions=False,
-            ),
-            dtype=np.int8,
-        )
-        if samples.ndim != 2 or samples.shape != (num_reads, matrix.shape[0]):
-            raise RuntimeError(
-                "Kaiwu returned samples with shape %s; expected (%d, %d)"
-                % (samples.shape, num_reads, matrix.shape[0])
             )
-        if not np.isin(samples, (-1, 1)).all():
-            raise RuntimeError("Kaiwu returned values outside {-1,+1}")
+        try:
+            samples = validate_raw_hardware_spins(
+                raw_samples, num_reads, matrix.shape[0]
+            )
+        except ValueError as exc:
+            raise KaiwuResponseError(str(exc), raw_samples, task_name) from exc
         return {
             "samples": samples,
             "metadata": {
                 "backend": "kaiwu_cim_sampling",
                 "task_name": task_name,
-                "task_id": str(
-                    getattr(optimizer, "task_id", getattr(optimizer, "id", ""))
-                ),
+                # The public SDK reference documents task_name/matrix identity,
+                # not optimizer.task_id/id. Never infer a platform task ID.
                 "hardware_n_bits": int(matrix.shape[0]),
                 "sample_number": int(num_reads),
             },

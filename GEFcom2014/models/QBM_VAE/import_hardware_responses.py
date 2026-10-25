@@ -17,6 +17,16 @@ ROOT_DIR = Path(__file__).resolve().parents[3]
 DEFAULT_OUTPUT_DIR = ROOT_DIR / "export" / "bosonic_responses" / "imported"
 
 
+class VSResponseValidationError(ValueError):
+    """A validation failure with the frozen task and offending response."""
+
+    def __init__(self, message, task, record):
+        super().__init__("%s [gain=%s, task=%s]" %
+                         (message, task.get("gain"), task.get("task_name")))
+        self.task = task
+        self.record = record
+
+
 def strict_response_record_valid(record, expected=None, require_physical=True):
     """Validate both the audit record and the raw 49-spin NPZ contents."""
     if not isinstance(record, dict) or record.get("completed") is not True:
@@ -47,13 +57,90 @@ def strict_response_record_valid(record, expected=None, require_physical=True):
     try:
         if sha256_file(response) != str(record["response_file_sha256"]):
             return False
+        verification = None
+        verification_path = record.get("platform_verification_path")
+        if verification_path:
+            verification_path = Path(verification_path)
+            from .kaiwu_platform_receipt import validate_platform_verification
+            verified_raw_path = Path(record.get("platform_verification_source_response", response))
+            if not verification_path.is_file() or sha256_file(verification_path) != record.get("platform_verification_sha256"):
+                return False
+            try:
+                verification = validate_platform_verification(verified_raw_path, verification_path, {
+                    "instance_id": record["instance_id"],
+                    "task_id": record["task_id"],
+                    "task_name": record["task_name"],
+                    "matrix_sha256": record["matrix_sha256"],
+                    "stage": record["stage"],
+                    "gain": record["gain"],
+                    "requested_reads": record["requested_reads"],
+                    "returned_reads": record["returned_reads"],
+                })
+            except (OSError, KeyError, TypeError, ValueError):
+                return False
+            receipt_fields = (
+                "platform_identifier_field", "platform_identifier_value",
+            )
+            if any(str(record.get(key, "")) != str(verification.get(key, ""))
+                   for key in receipt_fields):
+                return False
+            from .kaiwu_platform_receipt import _same_instant
+            for record_key, receipt_key in (
+                ("submitted_at", "client_called_at"),
+                ("completed_at", "client_returned_at"),
+                ("client_called_at", "client_called_at"),
+                ("client_returned_at", "client_returned_at"),
+                ("platform_submitted_at", "platform_submitted_at"),
+                ("platform_completed_at", "platform_completed_at"),
+            ):
+                if record.get(record_key):
+                    try:
+                        if not _same_instant(record[record_key], verification[receipt_key], record_key):
+                            return False
+                    except ValueError:
+                        return False
         with np.load(response, allow_pickle=False) as archive:
+            if (verification is not None
+                    and response.resolve() != verified_raw_path.resolve()):
+                for key in ("client_called_at", "client_returned_at", "platform_submitted_at",
+                            "platform_completed_at", "platform_identifier_field",
+                            "platform_identifier_value"):
+                    if key not in archive:
+                        return False
+                    archived_value = np.asarray(archive[key]).reshape(-1)
+                    if archived_value.size != 1:
+                        return False
+                    actual = str(archived_value[0].item())
+                    if key in ("client_called_at", "client_returned_at", "platform_submitted_at", "platform_completed_at"):
+                        try:
+                            if not _same_instant(actual, verification[key], key):
+                                return False
+                        except ValueError:
+                            return False
+                    elif actual != str(verification[key]):
+                        return False
             samples = np.asarray(archive["samples"])
-            if samples.shape != (returned, 49) or not np.isin(samples, (-1, 1)).all():
+            if samples.shape == (returned, 49):
+                hardware_samples = samples
+            elif ("hardware_samples" in archive
+                  and samples.shape == (returned, int(archive["logical_n_bits"]))
+                  and int(archive["hardware_n_bits"]) == 49):
+                hardware_samples = np.asarray(archive["hardware_samples"])
+                if hardware_samples.shape != (returned, 49):
+                    return False
+                expected_logical = normalize_hardware_spins(
+                    hardware_samples,
+                    logical_n_bits=int(archive["logical_n_bits"]),
+                    auxiliary_spin_index=int(archive["auxiliary_spin_index"]),
+                )
+                if not np.array_equal(samples, expected_logical):
+                    return False
+            else:
+                return False
+            if not np.isin(hardware_samples, (-1, 1)).all() or not np.isin(samples, (-1, 1)).all():
                 return False
             fields = {
                 "instance_id": record["instance_id"],
-                "task_id": record["task_id"],
                 "task_name": record["task_name"],
                 "matrix_sha256": record["matrix_sha256"],
                 "stage": record["stage"],
@@ -73,6 +160,14 @@ def strict_response_record_valid(record, expected=None, require_physical=True):
                         return False
                 elif str(actual) != str(expected_value):
                     return False
+            if "task_id" not in archive:
+                return False
+            archived_task_id = str(np.asarray(archive["task_id"]).reshape(-1)[0].item())
+            if archived_task_id:
+                if archived_task_id != str(record["task_id"]):
+                    return False
+            elif verification is None or str(verification["task_id"]) != str(record["task_id"]):
+                return False
     except (OSError, KeyError, TypeError, ValueError, IndexError):
         return False
     if expected:
@@ -102,6 +197,13 @@ def expand_samples(samples, n_bits, zero_spin=-1, reverse=False):
             "Samples must have shape (n_reads, %d); got %s"
             % (n_bits, samples.shape)
         )
+    if (not np.issubdtype(samples.dtype, np.number)
+            or np.issubdtype(samples.dtype, np.complexfloating)
+            or not np.isfinite(samples).all()):
+        raise ValueError("Samples must contain finite numeric values")
+    raw_values = set(np.unique(samples).tolist())
+    if not (raw_values.issubset({-1, 1}) or raw_values.issubset({0, 1})):
+        raise ValueError("Samples must contain only {-1,+1} or {0,1}")
     if reverse:
         samples = samples[:, ::-1]
     samples = samples.astype(np.int8)
@@ -126,7 +228,13 @@ def bitstrings_to_samples(bitstrings, n_bits):
 def apply_counts(samples, counts):
     if counts is None:
         return samples
-    counts = np.asarray(counts, dtype=np.int64)
+    raw_counts = np.asarray(counts)
+    if (not np.issubdtype(raw_counts.dtype, np.number)
+            or np.issubdtype(raw_counts.dtype, np.complexfloating)
+            or not np.isfinite(raw_counts).all()
+            or not np.equal(raw_counts, np.floor(raw_counts)).all()):
+        raise ValueError("counts must contain finite integer values")
+    counts = raw_counts.astype(np.int64)
     if counts.ndim != 1 or counts.size != samples.shape[0] or np.any(counts <= 0):
         raise ValueError("counts must be positive integers matching sample rows")
     return np.repeat(samples, counts, axis=0)
@@ -305,6 +413,16 @@ def import_responses(
     input_dir = Path(input_dir).resolve()
     output_dir = Path(output_dir).resolve()
     output_dir.mkdir(parents=True, exist_ok=True)
+    audit_path = output_dir / "response_import_audit.json"
+    if audit_path.exists():
+        raise RuntimeError("Existing response import audit; refusing to overwrite: %s" % audit_path)
+    existing_canonical = [
+        output_dir / (str(item["instance_id"]) + ".npz")
+        for item in submission["instances"]
+        if (output_dir / (str(item["instance_id"]) + ".npz")).exists()
+    ]
+    if existing_canonical:
+        raise RuntimeError("Existing canonical response; refusing to overwrite: %s" % existing_canonical[0])
     records = []
     missing = []
     for instance in submission["instances"]:
@@ -337,16 +455,50 @@ def import_responses(
             reverse=reverse,
         )
         if is_hardware_response:
-            task_id = str(
-                metadata.get(
-                    "task_id", metadata.get("job_id", metadata.get("task_name", ""))
-                )
-            )
+            task_id = str(metadata.get("task_id", metadata.get("job_id", "")))
             if not task_id:
-                raise ValueError(
-                    "Kaiwu response %s must include task_id, task_name, or job_id"
-                    % instance_id
-                )
+                from .kaiwu_platform_receipt import validate_platform_verification
+                verification_path = input_dir / (instance_id + ".platform_verification.json")
+                if not verification_path.is_file():
+                    raise ValueError(
+                        "Kaiwu response %s is waiting for a separate verified platform task receipt; task_name is not a task ID"
+                        % instance_id
+                    )
+                expected_name = json.loads(
+                    (Path(submission_manifest).resolve().parent / instance["payload"]).read_text(encoding="utf-8")
+                ).get("task_name")
+                receipt = validate_platform_verification(response_path, verification_path, {
+                    "instance_id": instance_id,
+                    "task_name": expected_name,
+                    "matrix_sha256": instance.get("hardware_matrix_sha256"),
+                    "stage": submission["stage"],
+                    "gain": instance.get("hardware_gain"),
+                    "requested_reads": submission["requested_reads_per_instance"],
+                    "returned_reads": samples.shape[0],
+                })
+                task_id = str(receipt["task_id"])
+                metadata.update({
+                    "task_id": task_id,
+                    "task_name": receipt["task_name"],
+                    "matrix_sha256": receipt["matrix_sha256"],
+                    "sdk_version": receipt["sdk_version"],
+                    "kaiwu_distribution_version": receipt["sdk_versions"]["importlib_metadata_version"],
+                    "kaiwu_module_version": receipt["sdk_versions"]["kaiwu_module_version"],
+                    "platform_backend": receipt["platform_backend"],
+                    "submitted_at": receipt["submitted_at"],
+                    "completed_at": receipt["completed_at"],
+                    "client_called_at": receipt["client_called_at"],
+                    "client_returned_at": receipt["client_returned_at"],
+                    "platform_submitted_at": receipt["platform_submitted_at"],
+                    "platform_completed_at": receipt["platform_completed_at"],
+                    "platform_identifier_field": receipt["platform_identifier_field"],
+                    "platform_identifier_value": receipt["platform_identifier_value"],
+                    "requested_reads": receipt["requested_reads"],
+                    "returned_reads": receipt["returned_reads"],
+                    "platform_verification_path": str(verification_path.resolve()),
+                    "platform_verification_sha256": sha256_file(verification_path),
+                    "platform_verification_source_response": str(response_path.resolve()),
+                })
             expected_task_name = None
             payload = json.loads(
                 (Path(submission_manifest).resolve().parent / instance["payload"]).read_text(
@@ -387,16 +539,18 @@ def import_responses(
             "applied_scale": float(metadata.get("applied_scale", np.nan)),
             "backend": str(metadata.get("backend", "bosonic_platform")),
             "job_id": str(metadata.get("job_id", metadata.get("task_id", ""))),
-            "task_id": str(
-                metadata.get(
-                    "task_id", metadata.get("job_id", metadata.get("task_name", ""))
-                )
-            ),
+            "task_id": str(metadata.get("task_id", metadata.get("job_id", ""))),
             "raw_response_sha256": sha256_file(response_path),
             "sdk_version": str(metadata.get("sdk_version", "")),
             "platform_backend": str(metadata.get("platform_backend", "")),
             "submitted_at": str(metadata.get("submitted_at", "")),
             "completed_at": str(metadata.get("completed_at", "")),
+            "client_called_at": str(metadata.get("client_called_at", metadata.get("submitted_at", ""))),
+            "client_returned_at": str(metadata.get("client_returned_at", metadata.get("completed_at", ""))),
+            "platform_submitted_at": str(metadata.get("platform_submitted_at", "")),
+            "platform_completed_at": str(metadata.get("platform_completed_at", "")),
+            "platform_identifier_field": str(metadata.get("platform_identifier_field", "")),
+            "platform_identifier_value": str(metadata.get("platform_identifier_value", "")),
             "requested_reads": int(metadata.get(
                 "requested_reads", submission["requested_reads_per_instance"]
             )),
@@ -449,7 +603,7 @@ def import_responses(
                 "task_id": str(
                     metadata.get(
                         "task_id",
-                        metadata.get("job_id", metadata.get("task_name", "")),
+                        metadata.get("job_id", ""),
                     )
                 ),
                 "task_name": str(metadata.get("task_name", "")),
@@ -461,10 +615,19 @@ def import_responses(
                     "kaiwu_module_version": str(metadata.get("kaiwu_module_version", "")),
                 },
                 "platform_backend": str(metadata.get("platform_backend", "")),
+                "client_called_at": str(metadata.get("client_called_at", metadata.get("submitted_at", ""))),
+                "client_returned_at": str(metadata.get("client_returned_at", metadata.get("completed_at", ""))),
+                "platform_submitted_at": str(metadata.get("platform_submitted_at", "")),
+                "platform_completed_at": str(metadata.get("platform_completed_at", "")),
+                "platform_identifier_field": str(metadata.get("platform_identifier_field", "")),
+                "platform_identifier_value": str(metadata.get("platform_identifier_value", "")),
                 "submitted_at": str(metadata.get("submitted_at", "")),
                 "completed_at": str(metadata.get("completed_at", "")),
                 "response_path": str(output_path.resolve()),
                 "response_file_sha256": canonical_hash,
+                "platform_verification_path": metadata.get("platform_verification_path", ""),
+                "platform_verification_sha256": metadata.get("platform_verification_sha256", ""),
+                "platform_verification_source_response": metadata.get("platform_verification_source_response", ""),
                 "checkpoint_dir": str(metadata.get("checkpoint_dir", "")),
                 "requested_reads": int(metadata.get(
                     "requested_reads", submission["requested_reads_per_instance"]
@@ -504,8 +667,9 @@ def import_responses(
         "bit_order": "index_descending" if reverse else "index_ascending",
         "records": records,
     }
-    audit_path = output_dir / "response_import_audit.json"
-    audit_path.write_text(json.dumps(audit, indent=2), encoding="utf-8")
+    with audit_path.open("x", encoding="utf-8") as handle:
+        json.dump(audit, handle, indent=2)
+        handle.write("\n")
     if missing and not allow_missing:
         raise FileNotFoundError(
             "Missing %d platform responses; see %s" % (len(missing), audit_path)

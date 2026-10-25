@@ -328,6 +328,8 @@ def parse_args():
     parser.add_argument("--grad-clip", type=float, default=5.0)
     parser.add_argument("--n-scenarios", type=int, default=100)
     parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument("--generation-seed", type=int, default=None)
+    parser.add_argument("--scenario-splits", nargs="+", choices=["VS", "TEST"], default=["VS", "TEST"])
     parser.add_argument("--cpu", action="store_true")
     parser.add_argument("--output-dir", type=Path, default=None)
     return parser.parse_args()
@@ -335,6 +337,7 @@ def parse_args():
 
 def main():
     args = parse_args()
+    generation_seed = args.seed if args.generation_seed is None else args.generation_seed
     random.seed(args.seed)
     np.random.seed(args.seed)
     torch.manual_seed(args.seed)
@@ -396,13 +399,15 @@ def main():
         json.dump(audit, handle, indent=2)
 
     for split, offset in (("VS", 104729), ("TEST", 130363)):
+        if split not in args.scenario_splits:
+            continue
         samples = sample_anchor_gaussian(
             model,
             arrays["x_" + split.lower()],
             anchors[split.lower()],
             args.n_scenarios,
             device,
-            seed=args.seed + offset,
+            seed=generation_seed + offset,
         )
         scenarios = scenarios_to_period_matrix(
             samples, target_scaler, args.tag, zero_indices

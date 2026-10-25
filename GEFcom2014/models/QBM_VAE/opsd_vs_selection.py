@@ -13,6 +13,7 @@ from .kaiwu_13k_protocol import (load_protocol, resolve_path, sha256_file,
     scenario_metrics, select_vs_gain, validate_vs_response_records)
 from .kaiwu_adapter import normalize_hardware_spins
 from .reconstruct_hardware_scenarios import decode_platform_spins
+from .import_hardware_responses import VSResponseValidationError
 
 
 def recompute_vs_predictions(records, preparation, protocol, require_physical=True,
@@ -95,24 +96,46 @@ def recompute_vs_predictions(records, preparation, protocol, require_physical=Tr
     model.eval()
     output = []
     for record in sorted(records, key=lambda r: (float(r["gain"]), str(r["instance_id"]))):
-        index, offset = by_key[(float(record["gain"]), str(record["instance_id"]))]
-        with np.load(resolve_path(record["source_problem_path"]), allow_pickle=False) as problem:
-            condition = np.asarray(problem["x_cond"], dtype=np.float32)
-        if condition.shape != conditions[index].shape or not np.allclose(condition, conditions[index], rtol=0, atol=1e-6):
-            raise ValueError("Frozen condition does not match the LS-scaled VS row")
-        with np.load(record["response_path"], allow_pickle=False) as response:
-            spins = normalize_hardware_spins(response["samples"], logical_n_bits=48)
-        seed = settings["noise_seed"] + offset
-        samples = decode_platform_spins(model, spins, condition, scaler,
-                                       observation_noise=True, seed=seed)
-        if samples.shape != (100, 24) or not np.isfinite(samples).all() or not np.isfinite(y_vs[index]).all():
-            raise ValueError("Non-finite or invalid VS predictions/targets")
-        metrics = scenario_metrics(samples, y_vs[index])
-        metrics["mean_bias"] = float(np.mean(samples - y_vs[index]))
-        if not np.isfinite(list(metrics.values())).all():
-            raise ValueError("Non-finite VS prediction metrics")
-        output.append({"instance_id": record["instance_id"], "gain": float(record["gain"]),
-                       "vs_index": index, "noise_seed": seed, "metrics": metrics})
+        task = expected_map[(float(record["gain"]), str(record["instance_id"]))]
+        try:
+            index, offset = by_key[(float(record["gain"]), str(record["instance_id"]))]
+            with np.load(resolve_path(record["source_problem_path"]), allow_pickle=False) as problem:
+                condition = np.asarray(problem["x_cond"], dtype=np.float32)
+            if condition.shape != conditions[index].shape or not np.allclose(condition, conditions[index], rtol=0, atol=1e-6):
+                raise ValueError("Frozen condition does not match the LS-scaled VS row")
+            with np.load(record["response_path"], allow_pickle=False) as response:
+                spins = normalize_hardware_spins(response["samples"], logical_n_bits=48)
+            seed = settings["noise_seed"] + offset
+            samples = decode_platform_spins(model, spins, condition, scaler,
+                                           observation_noise=True, seed=seed)
+            if samples.shape != (100, 24) or not np.isfinite(samples).all() or not np.isfinite(y_vs[index]).all():
+                raise ValueError("Non-finite or invalid VS predictions/targets")
+            metrics = scenario_metrics(samples, y_vs[index])
+            metrics["mean_bias"] = float(np.mean(samples - y_vs[index]))
+            metrics_50 = scenario_metrics(samples[:50], y_vs[index])
+            metrics_50["mean_bias"] = float(np.mean(samples[:50] - y_vs[index]))
+            prediction_read_sensitivity = {
+                "reads_50": metrics_50,
+                "reads_100": metrics,
+                "difference_50_minus_100": {
+                    key: float(metrics_50[key] - metrics[key])
+                    for key in metrics if key in metrics_50
+                },
+                "sample_overlap": 50,
+                "overlap_fraction_of_50_read_set": 1.0,
+                "same_decoder_noise_realization": True,
+                "interpretation": "overlapping read-count sensitivity only; not a convergence proof",
+            }
+            if not np.isfinite(list(metrics.values())).all():
+                raise ValueError("Non-finite VS prediction metrics")
+            if not np.isfinite(list(metrics_50.values())).all() or not np.isfinite(
+                    list(prediction_read_sensitivity["difference_50_minus_100"].values())).all():
+                raise ValueError("Non-finite 50/100-read VS sensitivity metrics")
+            output.append({"instance_id": record["instance_id"], "gain": float(record["gain"]),
+                           "vs_index": index, "noise_seed": seed, "metrics": metrics,
+                           "prediction_read_sensitivity": prediction_read_sensitivity})
+        except Exception as exc:
+            raise VSResponseValidationError(str(exc), task, record) from exc
     return output
 
 

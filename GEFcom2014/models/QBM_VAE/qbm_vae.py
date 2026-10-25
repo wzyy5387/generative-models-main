@@ -953,7 +953,7 @@ if __name__ == "__main__":
             y_scaler=y_LS_scaler,
             model=best_model,
             sampler=split_sampler,
-            max=1,
+            max=None if tag == "neso-wind" else 1,
             gpu=gpu,
             tag=tag,
             non_null_indexes=non_null_indexes,

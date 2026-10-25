@@ -80,6 +80,8 @@ def parse_args():
     parser.add_argument("--num-bins", type=int, default=8)
     parser.add_argument("--n-scenarios", type=int, default=100)
     parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument("--generation-seed", type=int, default=None)
+    parser.add_argument("--scenario-splits", nargs="+", choices=["VS", "TEST"], default=["VS", "TEST"])
     parser.add_argument("--device", default="auto", choices=["auto", "cpu", "cuda"])
     parser.add_argument("--output-dir", type=Path, default=None)
     return parser.parse_args()
@@ -87,6 +89,7 @@ def parse_args():
 
 def main():
     args = parse_args()
+    generation_seed = args.seed if args.generation_seed is None else args.generation_seed
     set_seed(args.seed)
     if args.device == "auto":
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -143,6 +146,8 @@ def main():
         json.dump(audit, handle, indent=2)
 
     for split, offset in (("VS", 104729), ("TEST", 130363)):
+        if split not in args.scenario_splits:
+            continue
         split_key = split.lower()
         samples = sample_anchor_spline_flow(
             model,
@@ -150,7 +155,7 @@ def main():
             anchors[split_key],
             args.n_scenarios,
             device,
-            seed=args.seed + offset,
+            seed=generation_seed + offset,
         )
         scenarios = scenarios_to_period_matrix(
             samples, target_scaler, args.tag, zero_indices

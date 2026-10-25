@@ -52,6 +52,8 @@ def validate_protocol(protocol):
         raise ValueError("Gain grid is frozen to [125, 150, 200]")
     if hardware["reads_per_instance"] != 100:
         raise ValueError("Reads per instance must be 100")
+    if protocol.get("gain_selection", {}).get("read_convergence") != [50, 100]:
+        raise ValueError("VS read sensitivity is frozen to overlapping [50, 100] prefixes")
     if protocol["dataset"]["selection_seed"] != 2026:
         raise ValueError("Selection seed must be 2026")
     if protocol["dataset"]["test_peeking"] is not False:
@@ -232,6 +234,11 @@ def read_response_metadata(path):
 
 
 def compare_read_convergence(h, j, reference, candidate, target_beta=1.0):
+    """Compare overlapping first-50 and full-100 read prefixes.
+
+    This is a read-count sensitivity diagnostic, not a convergence proof: the
+    50-read set is exactly contained in the 100-read set.
+    """
     if reference.shape[0] < 100 or candidate.shape[0] < 100:
         raise ValueError("VS convergence comparison requires at least 100 reads")
     result = {}
@@ -239,7 +246,12 @@ def compare_read_convergence(h, j, reference, candidate, target_beta=1.0):
         metrics = compare_response_pair(h, j, reference[:count], candidate[:count])
         metrics["effective_beta_error"] = abs(float(metrics["candidate_beta_eff"]) - float(target_beta))
         result["reads_%d" % count] = metrics
-    return result
+    return {
+        "comparison": result,
+        "sample_overlap": 50,
+        "overlap_fraction_of_50_read_set": 1.0,
+        "interpretation": "overlapping read-count sensitivity only; not a convergence proof",
+    }
 
 
 def _recompute_response_metrics(record, target_beta=1.0, require_reference_provenance=False):
@@ -308,12 +320,15 @@ def _recompute_response_metrics(record, target_beta=1.0, require_reference_prove
             or not np.isin(reference_samples, (-1, 1)).all()):
         raise ValueError("Frozen VS reference samples have the wrong logical dimension")
     metrics = compare_response_pair(h, j, reference_samples, logical)
+    read_convergence = compare_read_convergence(h, j, reference_samples, logical)
     metrics["effective_beta_error"] = abs(float(metrics["candidate_beta_eff"]) - float(target_beta))
     metrics["unique_state_fraction"] = float(metrics["candidate_unique_state_fraction"])
     result = {key: float(metrics[key]) for key in (
         "energy_wasserstein", "effective_beta_error", "edge_moment_mae",
         "magnetization_mae", "unique_state_fraction")}
-    if not np.isfinite(list(result.values())).all():
+    result["read_convergence_diagnostics"] = read_convergence
+    if not np.isfinite([value for value in result.values()
+                        if isinstance(value, (int, float, np.integer, np.floating))]).all():
         raise ValueError("VS recomputed calibration metrics are non-finite")
     return result
 
@@ -339,6 +354,12 @@ def aggregate_gain_metrics(response_records, recompute=False, prediction_inputs=
             "edge_moment_mae": float(np.mean([row["edge_moment_mae"] for row in metrics])),
             "magnetization_mae": float(np.mean([row["magnetization_mae"] for row in metrics])),
             "unique_state_fraction": float(np.mean([row["unique_state_fraction"] for row in metrics])),
+            "read_convergence_diagnostics": [
+                {"instance_id": record["instance_id"],
+                 **metric.get("read_convergence_diagnostics", {})}
+                for record, metric in zip(records, metrics)
+                if metric.get("read_convergence_diagnostics")
+            ],
         })
     if prediction_inputs is not None:
         from .opsd_vs_selection import recompute_vs_predictions
@@ -348,6 +369,11 @@ def aggregate_gain_metrics(response_records, recompute=False, prediction_inputs=
             daily = [item for item in predictions if item["gain"] == row["gain"]]
             row["raw_vs_crps"] = float(np.mean([item["metrics"]["CRPS"] for item in daily]))
             row["vs_prediction_metrics"] = daily
+            row["prediction_read_sensitivity_diagnostics"] = [
+                {"instance_id": item["instance_id"],
+                 **item["prediction_read_sensitivity"]}
+                for item in daily
+            ]
     return rows
 
 
@@ -677,12 +703,27 @@ def scenario_metrics(samples, target):
     }
 
 
-def paired_date_inference(differences, repetitions=2000, seed=2026):
+def paired_date_inference(differences, repetitions=2000, seed=2026,
+                          block_length_days=7):
     differences = np.asarray(differences, dtype=np.float64)
+    if differences.ndim != 1 or differences.size == 0 or not np.isfinite(differences).all():
+        raise ValueError("date differences must be a non-empty finite one-dimensional array")
+    if repetitions < 1 or block_length_days < 1:
+        raise ValueError("repetitions and block_length_days must be positive")
+    # Reuse the OPSD chronological non-overlapping block bootstrap. Inference
+    # assumes blocks are exchangeable; sign-flips additionally assume block-
+    # level symmetry under the paired null. Within-block dependence is retained.
+    from GEFcom2014.forecast_quality.opsd_topology_vs_evaluation import (
+        _time_blocks, _weighted_block_bootstrap,
+    )
     rng = np.random.default_rng(seed)
-    boot = rng.choice(differences, size=(repetitions, differences.size), replace=True).mean(axis=1)
-    signs = rng.choice([-1.0, 1.0], size=(repetitions, differences.size))
-    null = (signs * differences[None, :]).mean(axis=1)
+    blocks = _time_blocks(differences, block_length_days)
+    boot, block_lengths = _weighted_block_bootstrap(
+        differences, repetitions, rng, block_size=block_length_days
+    )
+    signs = rng.choice([-1.0, 1.0], size=(repetitions, len(blocks)))
+    block_sums = np.asarray([block.sum() for block in blocks], dtype=np.float64)
+    null = (signs * block_sums[None, :]).sum(axis=1) / differences.size
     mean = float(differences.mean())
     return {
         "mean_difference": mean,
@@ -691,36 +732,66 @@ def paired_date_inference(differences, repetitions=2000, seed=2026):
         "paired_sign_flip_p": float((np.count_nonzero(np.abs(null) >= abs(mean)) + 1) / (repetitions + 1)),
         "effect_size": float(mean / (differences.std(ddof=1) + 1e-12)) if differences.size > 1 else 0.0,
         "n_instance_dates": int(differences.size),
+        "n_date_blocks": int(len(block_lengths)),
+        "block_length_days": int(block_length_days),
+        "inference_assumption": "exchangeable non-overlapping chronological blocks; symmetric block differences for sign-flip",
     }
 
 
-def aggregate_test_metrics(rows, reference_model="float_logical_sa", repetitions=2000, seed=2026):
-    """Aggregate one metric row per instance/date; reads remain within each row."""
-    if not rows:
-        raise ValueError("No TEST metric rows supplied")
+def aggregate_test_metrics(rows, expected_dates, repetitions=2000, seed=2026,
+                           block_length_days=7):
+    """Compare fixed A/B/C daily rows; expected dates come from the frozen manifest.
+
+    A=float logical SA, B=int8-matrix SA, C=SPQC-550. B vs C is primary;
+    A vs B is the representation/quantization contrast.
+    """
+    if not rows or not expected_dates:
+        raise ValueError("Rows and the complete frozen expected-date list are required")
+    models = ("float_logical_sa", "int8_matrix_sa", "spqc_550")
+    expected = [str(np.datetime64(str(value), "D")) for value in expected_dates]
+    if len(expected) != len(set(expected)):
+        raise ValueError("Frozen expected dates contain duplicates")
     grouped = {}
     for row in rows:
-        key = (str(row["date"]), str(row["model"]))
-        grouped.setdefault(key, {metric: [] for metric in ("CRPS", "Energy", "Variogram", "Ramp_CRPS", "coverage", "PICP90", "interval_width90", "MAQCE")})
-        for metric in grouped[key]:
-            grouped[key][metric].append(float(row[metric]))
-    means = {(date, model): {metric: float(np.mean(values)) for metric, values in data.items()}
-             for (date, model), data in grouped.items()}
-    models = sorted({model for _, model in means})
-    if reference_model not in models:
-        raise ValueError("Reference TEST model is absent")
-    comparisons = []
-    for model in models:
-        if model == reference_model:
-            continue
+        date = str(np.datetime64(str(row["date"]), "D"))
+        model = str(row["model"])
+        if date not in expected or model not in models:
+            raise ValueError("Unexpected TEST date or model: %s / %s" % (date, model))
+        key = (date, model)
+        if key in grouped:
+            raise ValueError("Duplicate daily TEST row for %s / %s" % key)
+        values = {}
         for metric in ("CRPS", "Energy", "Variogram", "Ramp_CRPS", "coverage", "PICP90", "interval_width90", "MAQCE"):
-            diffs = [means[(date, model)][metric] - means[(date, reference_model)][metric]
-                     for date in sorted({date for date, _ in means})
-                     if (date, model) in means and (date, reference_model) in means]
-            if diffs:
-                comparisons.append({"model": model, "reference_model": reference_model,
-                                    "metric": metric, **paired_date_inference(diffs, repetitions, seed)})
-    return {"paired_comparisons": comparisons, "reads_are_independent_test_units": False}
+            value = float(row[metric])
+            if not np.isfinite(value):
+                raise ValueError("Non-finite daily metric for %s / %s" % key)
+            values[metric] = value
+        grouped[key] = values
+    required = {(date, model) for date in expected for model in models}
+    if set(grouped) != required:
+        missing = sorted(required - set(grouped))
+        extra = sorted(set(grouped) - required)
+        raise ValueError("TEST daily panel incomplete (missing=%d, extra=%d)" % (len(missing), len(extra)))
+    comparisons = []
+    contrasts = (("spqc_550", "int8_matrix_sa", "primary_B_vs_C"),
+                 ("int8_matrix_sa", "float_logical_sa", "secondary_A_vs_B"))
+    for model, reference_model, role in contrasts:
+        for metric in ("CRPS", "Energy", "Variogram", "Ramp_CRPS", "coverage", "PICP90", "interval_width90", "MAQCE"):
+            diffs = [grouped[(date, model)][metric] - grouped[(date, reference_model)][metric]
+                     for date in expected]
+            comparisons.append({"model": model, "reference_model": reference_model,
+                                "contrast_role": role, "metric": metric,
+                                **paired_date_inference(
+                                    diffs, repetitions, seed, block_length_days
+                                )})
+    return {
+        "paired_comparisons": comparisons,
+        "model_roles": {"A": models[0], "B": models[1], "C": models[2]},
+        "primary_contrast": "B_vs_C",
+        "secondary_contrast": "A_vs_B",
+        "expected_dates": expected,
+        "reads_are_independent_test_units": False,
+    }
 
 
 def readiness_report(protocol, budget, vs_paths, test_path, output_path, missing_platform=True):

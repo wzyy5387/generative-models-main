@@ -803,7 +803,8 @@ def build_qbm_vae_scenarios(n_s, x, y_scaler, model, sampler=None, max=1, gpu=Tr
             generator=generator,
         )
         samples = y_scaler.inverse_transform(samples)
-        samples = np.clip(samples, 0, max)
+        if max is not None:
+            samples = np.clip(samples, 0, max)
         if tag == "pv" and non_null_indexes is not None:
             rebuilt = np.zeros((n_s, 24))
             rebuilt[:, non_null_indexes] = samples
@@ -853,7 +854,8 @@ def _build_batched_qbm_vae_scenarios(n_s, x, y_scaler, model, sampler, max_value
                 samples = mean
             samples = samples.cpu().numpy()
             samples = y_scaler.inverse_transform(samples)
-            samples = np.clip(samples, 0, max_value)
+            if max_value is not None:
+                samples = np.clip(samples, 0, max_value)
             n_days = x_chunk.shape[0]
             samples = samples.reshape(n_days, n_s, -1)
             if tag == "pv" and non_null_indexes is not None:

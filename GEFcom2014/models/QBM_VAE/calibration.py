@@ -80,6 +80,9 @@ def fit_effective_temperature_pseudolikelihood(h, j, samples, beta_grid=None):
     return {
         "beta_eff": float(beta_grid[best_index]),
         "pseudolikelihood_nll": float(losses[best_index]),
+        "beta_grid_min": float(beta_grid[0]),
+        "beta_grid_max": float(beta_grid[-1]),
+        "beta_eff_status": "current_range_unresolved" if best_index in (0, beta_grid.size - 1) else "grid_interior_estimate",
         "n_samples": int(samples.shape[0]),
         "n_bits": int(samples.shape[1]),
         "grid_boundary": bool(best_index in (0, beta_grid.size - 1)),
@@ -136,6 +139,9 @@ def fit_shared_effective_temperature_pseudolikelihood(
     result = {
         "beta_eff": float(beta_grid[best_index]),
         "pseudolikelihood_nll": float(mean_losses[best_index]),
+        "beta_grid_min": float(beta_grid[0]),
+        "beta_grid_max": float(beta_grid[-1]),
+        "beta_eff_status": "current_range_unresolved" if best_index in (0, beta_grid.size - 1) else "grid_interior_estimate",
         "n_instances": int(len(problems)),
         "n_samples": int(total_samples),
         "n_bits_min": int(min(n_bits_values)),

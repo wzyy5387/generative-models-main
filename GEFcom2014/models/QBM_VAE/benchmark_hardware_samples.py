@@ -133,6 +133,9 @@ def summarize_response(instance, response_path):
         "beta_eff_pseudolikelihood": calibration["beta_eff"],
         "beta_eff_nll": calibration["pseudolikelihood_nll"],
         "beta_eff_grid_boundary": calibration["grid_boundary"],
+        "beta_eff_grid_min": calibration["beta_grid_min"],
+        "beta_eff_grid_max": calibration["beta_grid_max"],
+        "beta_eff_status": calibration["beta_eff_status"],
         "response_path": str(response_path),
     }
 

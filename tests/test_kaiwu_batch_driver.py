@@ -8,6 +8,7 @@ import hashlib
 
 from GEFcom2014.models.QBM_VAE.run_kaiwu_13k_sampling import (
     _load_completed,
+    _load_pending_intents,
     _query_existing_task,
     _recover_pending_intent,
     planned_tasks,
@@ -26,6 +27,28 @@ def test_kaiwu_batch_default_dry_run_lists_frozen_budget():
     result = subprocess.run(command, capture_output=True, text=True, check=True)
     assert "tasks=30 reads=3000 dry_run=True" in result.stdout
     assert '"hardware_claim": false' in result.stdout
+
+
+def test_vs_execution_order_is_date_interleaved_and_bound_to_frozen_inputs(tmp_path):
+    from GEFcom2014.models.QBM_VAE.run_kaiwu_13k_sampling import (
+        _vs_tasks, build_vs_execution_order, validate_vs_execution_order,
+    )
+    protocol = load_protocol("configs/paper/fa_bm_vae_opsd_sa_negative_kaiwu_protocol.json")
+    protocol["_path"] = "configs/paper/fa_bm_vae_opsd_sa_negative_kaiwu_protocol.json"
+    prep = __import__("pathlib").Path("export/opsd_sa_negative_kaiwu_preparation_v8")
+    tasks = _vs_tasks(prep, protocol)
+    assert len(tasks) == 30
+    assert [task["gain"] for task in tasks[:3]] == [125, 150, 200]
+    assert [task["gain"] for task in tasks[3:6]] == [150, 200, 125]
+    assert all(task["reads"] == 100 for task in tasks)
+    payload = build_vs_execution_order(tasks, "a" * 64, "b" * 64)
+    order_path = tmp_path / "vs_execution_order.json"
+    order_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+    assert validate_vs_execution_order(order_path, tasks, "a" * 64, "b" * 64) == payload
+    payload["entries"][0]["gain"] = 200
+    order_path.write_text(json.dumps(payload), encoding="utf-8")
+    with pytest.raises(RuntimeError, match="does not match frozen"):
+        validate_vs_execution_order(order_path, tasks, "a" * 64, "b" * 64)
 
 
 def test_opsd_v5_stale_task_names_are_rejected_instead_of_rewritten():
@@ -182,20 +205,10 @@ def test_batch_stops_on_invalid_response_without_retry(tmp_path, monkeypatch, st
     from tests.test_kaiwu_13k_protocol import _approved_quality_policy
 
     tasks = [{"stage": stage, "instance_id": "i%d" % i, "gain": 125,
-              "matrix_sha256": "mh%d" % i, "reads": 100, "requested_reads": 100,
+              "matrix_sha256": hashlib.sha256(("mh%d" % i).encode()).hexdigest(),
+              "reads": 100, "requested_reads": 100,
               "matrix": tmp_path / ("matrix%d.npz" % i)} for i in range(3)]
     quality_policy = _approved_quality_policy()
-    if failure == "prediction_failure":
-        quality_policy.update(mode="engineering_valid_prediction_selection", policy_approved=True,
-                              selection_metric="raw_vs_crps", tie_break="lower_gain")
-        from GEFcom2014.models.QBM_VAE import opsd_vs_selection, kaiwu_13k_protocol
-        monkeypatch.setattr(kaiwu_13k_protocol, "_recompute_response_metrics", lambda r: {})
-        def invalid_decode(*args, **kwargs):
-            if not args[0]:
-                return []  # Zero-response preflight succeeds; submitted decoding fails.
-            raise ValueError("Non-finite VS predictions")
-        monkeypatch.setattr(opsd_vs_selection, "recompute_vs_predictions", invalid_decode)
-        monkeypatch.setattr(driver, "_validate_preparation_identity", lambda *args: None)
     monkeypatch.setattr(driver, "load_protocol", lambda _: {
         "protocol_version": "test-only", "gain_selection": {"quality_gate": quality_policy}})
     monkeypatch.setattr(driver, "planned_tasks", lambda *args: tasks)
@@ -259,8 +272,10 @@ def test_batch_stops_on_invalid_response_without_retry(tmp_path, monkeypatch, st
         assert run(args)["completed"] == 3
         assert len(calls) == 3  # Successful responses are not submitted twice either.
         assert not list(args.output_dir.rglob("*.validation_failure.json"))
+        assert all(payload[1]["state"] == "completed"
+                   for payload in _load_pending_intents(args.checkpoint_dir).values())
     else:
-        with pytest.raises(RuntimeError, match="response failed strict validation"):
+        with pytest.raises(RuntimeError, match="response failed (strict|full frozen VS) validation"):
             run(args)
         assert len(calls) == fail_index + 1
         failures = list(args.output_dir.rglob("*.validation_failure.json"))
@@ -275,7 +290,7 @@ def test_batch_stops_on_invalid_response_without_retry(tmp_path, monkeypatch, st
         # Pending intent must block both resume and accidental non-resume retries.
         for resume in (True, False):
             args.resume = resume
-            with pytest.raises(RuntimeError, match="状态未知|manual platform|prediction validation failure"):
+            with pytest.raises(RuntimeError, match="Prior response validation failure|manual platform|validation failure"):
                 run(args)
             assert len(calls) == fail_index + 1
         assert len(list(args.checkpoint_dir.glob("*.intent.json"))) == fail_index + 1
@@ -284,7 +299,29 @@ def test_batch_stops_on_invalid_response_without_retry(tmp_path, monkeypatch, st
 
 
 def test_nonfinite_prediction_stops_batch_and_blocks_resume(tmp_path, monkeypatch):
-    test_batch_stops_on_invalid_response_without_retry(tmp_path, monkeypatch, "vs", "prediction_failure")
+    from tests.test_kaiwu_response_recovery_validation import (
+        test_new_prediction_failure_is_recorded_before_next_submit_and_restart_stops,
+    )
+    test_new_prediction_failure_is_recorded_before_next_submit_and_restart_stops(tmp_path, monkeypatch)
+
+
+@pytest.mark.parametrize("contents", ["{truncated", json.dumps({"task_name": "x"})])
+def test_corrupt_or_incomplete_pending_intent_fails_closed(tmp_path, contents):
+    path = tmp_path / "x.intent.json"
+    path.write_text(contents, encoding="utf-8")
+    with pytest.raises(RuntimeError, match="intent"):
+        _load_pending_intents(tmp_path)
+
+
+def test_pending_intent_filename_and_task_identity_are_validated(tmp_path):
+    payload = {"task_name": "another", "stage": "vs", "instance_id": "i",
+               "gain": 125, "matrix_sha256": "a" * 64,
+               "requested_reads": 100, "created_at": "2026-10-21T00:00:00Z",
+               "state": "pending"}
+    path = tmp_path / "expected.intent.json"
+    path.write_text(json.dumps(payload), encoding="utf-8")
+    with pytest.raises(RuntimeError, match="identity or state"):
+        _load_pending_intents(tmp_path)
 
 
 def test_real_execution_checks_spqc550_profile(tmp_path):

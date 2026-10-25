@@ -8,6 +8,7 @@ from GEFcom2014.models.QBM_VAE.kaiwu_13k_protocol import (
     audit_budget,
     compare_read_convergence,
     load_protocol,
+    paired_date_inference,
     select_vs_gain,
     scenario_metrics,
     validate_vs_response_records,
@@ -221,18 +222,74 @@ def test_read_convergence_and_test_metrics_keep_reads_within_instance():
     reference = np.tile(np.array([[1, -1]], dtype=np.int8), (100, 1))
     candidate = reference.copy()
     convergence = compare_read_convergence(h, j, reference, candidate)
-    assert set(convergence) == {"reads_50", "reads_100"}
-    assert convergence["reads_100"]["energy_wasserstein"] == 0.0
+    assert set(convergence["comparison"]) == {"reads_50", "reads_100"}
+    assert convergence["comparison"]["reads_100"]["energy_wasserstein"] == 0.0
+    assert convergence["sample_overlap"] == 50
+    assert "not a convergence proof" in convergence["interpretation"]
 
     samples = np.tile(np.array([[0.2, 0.4, 0.6]], dtype=float), (100, 1))
     metrics = scenario_metrics(samples, np.array([0.2, 0.4, 0.6]))
     rows = []
+    dates = ["2020-01-%02d" % day for day in range(1, 4)]
     for day in range(3):
-        rows.append({"date": "2020-01-%02d" % (day + 1), "model": "hardware", **metrics})
-        rows.append({"date": "2020-01-%02d" % (day + 1), "model": "float_logical_sa", **metrics})
-    result = aggregate_test_metrics(rows, repetitions=100)
+        for model in ("float_logical_sa", "int8_matrix_sa", "spqc_550"):
+            rows.append({"date": dates[day], "model": model, **metrics})
+    result = aggregate_test_metrics(rows, dates, repetitions=100)
     assert result["reads_are_independent_test_units"] is False
-    assert result["paired_comparisons"][0]["n_instance_dates"] == 3
+    assert result["primary_contrast"] == "B_vs_C"
+    assert result["paired_comparisons"][0]["reference_model"] == "int8_matrix_sa"
+    assert result["paired_comparisons"][0]["n_date_blocks"] == 1
+
+
+def test_test_aggregation_rejects_missing_duplicate_and_unexpected_dates():
+    metrics = {key: 0.1 for key in (
+        "CRPS", "Energy", "Variogram", "Ramp_CRPS", "coverage", "PICP90",
+        "interval_width90", "MAQCE",
+    )}
+    dates = ["2020-01-01", "2020-01-02", "2020-01-03"]
+    rows = [{"date": date, "model": model, **metrics}
+            for date in dates for model in ("float_logical_sa", "int8_matrix_sa", "spqc_550")]
+    with pytest.raises(ValueError, match="incomplete"):
+        aggregate_test_metrics(rows[:-1], dates, repetitions=20)
+    with pytest.raises(ValueError, match="Duplicate"):
+        aggregate_test_metrics(rows + [rows[0]], dates, repetitions=20)
+    with pytest.raises(ValueError, match="Unexpected"):
+        aggregate_test_metrics(rows + [{**rows[0], "date": "2020-01-04"}], dates, repetitions=20)
+
+
+def test_paired_inference_resamples_contiguous_date_blocks_reproducibly():
+    differences = np.repeat(np.array([-1.0, 0.5, 1.5]), [7, 7, 1])
+    first = paired_date_inference(differences, repetitions=200, seed=19, block_length_days=7)
+    second = paired_date_inference(differences, repetitions=200, seed=19, block_length_days=7)
+    assert first == second
+    assert first["n_instance_dates"] == 15
+    assert first["n_date_blocks"] == 3
+    assert first["block_length_days"] == 7
+    assert "exchangeable non-overlapping" in first["inference_assumption"]
+
+
+def test_effective_beta_boundary_is_labeled_unresolved_with_range_and_loss():
+    from GEFcom2014.models.QBM_VAE.calibration import fit_effective_temperature_pseudolikelihood
+    samples = np.tile(np.array([[1, -1]], dtype=np.int8), (8, 1))
+    result = fit_effective_temperature_pseudolikelihood(
+        np.zeros(2), np.zeros((2, 2)), samples,
+        beta_grid=np.array([0.02, 0.5, 1.0]))
+    assert result["grid_boundary"] is True
+    assert result["beta_eff_status"] == "current_range_unresolved"
+    assert result["beta_grid_min"] == 0.02
+    assert result["beta_grid_max"] == 1.0
+    assert np.isfinite(result["pseudolikelihood_nll"])
+
+
+def test_response_statistics_preserve_boundary_label_and_fit_loss():
+    from GEFcom2014.models.QBM_VAE.compare_hardware_responses import response_statistics
+    samples = np.tile(np.array([[1, -1]], dtype=np.int8), (10, 1))
+    stats = response_statistics(np.zeros(2), np.zeros((2, 2)), samples)
+    assert stats["beta_eff_grid_boundary"] is True
+    assert stats["beta_eff_status"] == "current_range_unresolved"
+    assert stats["beta_eff_grid_min"] == 0.02
+    assert stats["beta_eff_grid_max"] == 5.0
+    assert np.isfinite(stats["beta_eff_fit_loss"])
 
 
 def test_hardware_metric_adapter_matches_classical_daily_definition():

@@ -62,6 +62,11 @@ def scale_payload(payload, coefficient_scale, calibration):
         "logical_beta": calibration.get("logical_beta", calibration["target_beta"]),
         "matrix_beta": calibration.get("matrix_beta", calibration["target_beta"]),
         "estimated_beta_eff": calibration["beta_eff"],
+        "effective_temperature_status": calibration.get("beta_eff_status", "unknown"),
+        "beta_eff_grid_min": calibration.get("beta_grid_min"),
+        "beta_eff_grid_max": calibration.get("beta_grid_max"),
+        "beta_eff_grid_boundary": calibration.get("grid_boundary"),
+        "beta_eff_fit_loss": calibration.get("pseudolikelihood_nll"),
         "coefficient_scale": coefficient_scale,
         "platform_has_no_direct_beta": bool(
             calibration.get("platform_has_no_direct_beta", False)
@@ -327,20 +332,26 @@ def main():
             "vs_response_paths": response_paths,
         }
     )
+    calibration["effective_temperature_status"] = calibration.get(
+        "beta_eff_status", "unknown")
     args.output_dir.mkdir(parents=True, exist_ok=True)
     calibration_path = args.output_dir / "effective_temperature.json"
     calibration_path.write_text(
         json.dumps(calibration, indent=2), encoding="utf-8"
     )
-    print(
-        "VS beta_eff %.4f [%.4f, %.4f] -> coefficient scale %.4f"
-        % (
-            calibration["beta_eff"],
-            calibration.get("beta_eff_ci_2.5", calibration["beta_eff"]),
-            calibration.get("beta_eff_ci_97.5", calibration["beta_eff"]),
-            coefficient_scale,
+    if calibration.get("grid_boundary"):
+        print("VS beta_eff is at a beta-grid boundary; current range cannot determine it; candidate scale %.4f is provisional"
+              % coefficient_scale)
+    else:
+        print(
+            "VS beta_eff %.4f [%.4f, %.4f] -> coefficient scale %.4f"
+            % (
+                calibration["beta_eff"],
+                calibration.get("beta_eff_ci_2.5", calibration["beta_eff"]),
+                calibration.get("beta_eff_ci_97.5", calibration["beta_eff"]),
+                coefficient_scale,
+            )
         )
-    )
     if args.test_manifest is not None:
         manifest_path = write_scaled_manifest(
             args.test_manifest,

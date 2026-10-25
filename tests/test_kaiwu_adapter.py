@@ -5,7 +5,9 @@ from types import SimpleNamespace
 import numpy as np
 import pytest
 
-from GEFcom2014.models.QBM_VAE.import_hardware_responses import import_responses
+from GEFcom2014.models.QBM_VAE.import_hardware_responses import (
+    apply_counts, expand_samples, import_responses,
+)
 from GEFcom2014.models.QBM_VAE.kaiwu_adapter import (
     KaiwuClient,
     binary_to_spin,
@@ -15,6 +17,7 @@ from GEFcom2014.models.QBM_VAE.kaiwu_adapter import (
     normalize_hardware_spins,
     quantize_hardware_matrix,
     spin_to_binary,
+    validate_raw_hardware_spins,
 )
 from GEFcom2014.models.QBM_VAE.export_ising_instances import build_platform_payload
 from GEFcom2014.models.QBM_VAE.prepare_bosonic_submission import prepare_submission
@@ -170,6 +173,36 @@ def test_gauge_normalization_and_binary_mapping_are_exact():
         normalize_hardware_spins(np.ones((2, 3), dtype=np.int8), logical_n_bits=3)
 
 
+@pytest.mark.parametrize("raw", [
+    np.full((10, 49), 1.9),
+    np.full((10, 49), np.nan),
+])
+def test_raw_response_is_validated_before_int8_conversion(raw):
+    with pytest.raises(ValueError):
+        validate_raw_hardware_spins(raw, 10, 49)
+    with pytest.raises(ValueError):
+        expand_samples(raw, 49)
+
+
+def test_raw_response_wrong_width_is_rejected():
+    with pytest.raises(ValueError):
+        validate_raw_hardware_spins(np.ones((10, 48)), 10, 49)
+    with pytest.raises(ValueError):
+        expand_samples(np.ones((10, 48)), 49)
+
+
+def test_valid_float_spin_values_convert_only_after_validation():
+    raw = np.ones((10, 49), dtype=np.float64)
+    assert validate_raw_hardware_spins(raw, 10, 49).dtype == np.int8
+    assert expand_samples(raw, 49).dtype == np.int8
+
+
+@pytest.mark.parametrize("counts", [[1.9], [np.nan], [0]])
+def test_response_counts_reject_fractional_nonfinite_or_nonpositive_values(counts):
+    with pytest.raises(ValueError):
+        apply_counts(np.ones((1, 49), dtype=np.int8), counts)
+
+
 def test_hardware_submission_and_import_keep_49_raw_and_48_logical(tmp_path):
     h = np.full(48, 0.2)
     j = np.zeros((48, 48))
@@ -222,6 +255,7 @@ def test_hardware_submission_and_import_keep_49_raw_and_48_logical(tmp_path):
         samples=raw_samples,
         instance_id="example_000",
         task_id="kaiwu-task-1",
+        task_name="fa_bm_vae_example_task",
         matrix_sha256=np.asarray(payload["hardware_matrix_sha256"]),
         bit_order="index_ascending",
         backend="kaiwu",
@@ -236,6 +270,15 @@ def test_hardware_submission_and_import_keep_49_raw_and_48_logical(tmp_path):
         assert response["samples"].shape == (10, 48)
         np.testing.assert_array_equal(response["samples"][0], -np.ones(48, dtype=np.int8))
     assert audit["records"][0]["logical_n_bits"] == 48
+
+    np.savez_compressed(
+        raw_dir / "example_000.npz", samples=raw_samples,
+        instance_id="example_000", task_name="fa_bm_vae_example_task",
+        matrix_sha256=np.asarray(payload["hardware_matrix_sha256"]),
+        bit_order="index_ascending", backend="kaiwu",
+    )
+    with pytest.raises(ValueError, match="task_name is not a task ID"):
+        import_responses(submission_path, raw_dir, tmp_path / "no-task-id")
 
 
 @pytest.mark.parametrize("missing", ["index", "export_index", "date"])
@@ -369,6 +412,85 @@ def test_submit_one_uses_task_checkpoint_and_records_runtime_audit(tmp_path, mon
     with np.load(output_path) as raw:
         assert bool(raw["hardware_claim"]) is False
         assert bool(raw["physical_platform_used"]) is False
+
+
+def test_submit_one_saves_valid_response_pending_platform_identity(tmp_path, monkeypatch):
+    matrix = np.zeros((49, 49), dtype=np.int8)
+    matrix[0, 48] = matrix[48, 0] = 1
+    matrix_path = tmp_path / "matrix.npz"
+    np.savez_compressed(matrix_path, hardware_matrix=matrix)
+
+    class FakeCheckpointManager:
+        save_dir = None
+
+    class FakeClient:
+        def __init__(self, **kwargs):
+            self._kaiwu = SimpleNamespace(
+                __version__="test-sdk",
+                common=SimpleNamespace(CheckpointManager=FakeCheckpointManager),
+            )
+
+        def sample_hardware_matrix(self, matrix, num_reads, task_name):
+            return {
+                "samples": np.ones((num_reads, matrix.shape[0]), dtype=np.int8),
+                "metadata": {"backend": "kaiwu_cim_sampling", "task_name": task_name},
+            }
+
+    monkeypatch.setattr(
+        "GEFcom2014.models.QBM_VAE.submit_kaiwu_sampling.KaiwuClient", FakeClient)
+    output_path, audit_path, audit = submit_one(
+        matrix_path, "await-platform", tmp_path / "responses", 10,
+        checkpoint_dir=tmp_path / "checkpoints", task_name="documented-task-name")
+    assert output_path.is_file() and audit_path.is_file()
+    assert audit["task_id"] == ""
+    assert audit["completed"] is False
+    assert audit["hardware_claim"] is False
+    with np.load(output_path, allow_pickle=False) as response:
+        assert response["samples"].shape == (10, 49)
+        assert str(response["task_id"].item()) == ""
+
+
+def test_submit_one_preserves_invalid_raw_response_and_refuses_result(tmp_path, monkeypatch):
+    matrix_path = tmp_path / "matrix.npz"
+    np.savez_compressed(matrix_path, hardware_matrix=np.zeros((49, 49), dtype=np.int8))
+
+    class FakeCheckpointManager:
+        save_dir = None
+
+    class FakeClient:
+        def __init__(self, **kwargs):
+            self._kaiwu = SimpleNamespace(common=SimpleNamespace(CheckpointManager=FakeCheckpointManager))
+
+        def sample_hardware_matrix(self, matrix, num_reads, task_name):
+            return {"samples": np.full((num_reads, 49), 1.9), "metadata": {"task_name": task_name}}
+
+    monkeypatch.setattr(
+        "GEFcom2014.models.QBM_VAE.submit_kaiwu_sampling.KaiwuClient", FakeClient
+    )
+    output = tmp_path / "responses"
+    with pytest.raises(RuntimeError, match="without retry"):
+        submit_one(matrix_path, "bad-response", output, 10,
+                   checkpoint_dir=tmp_path / "checkpoints", task_name="task-bad")
+    failure = json.loads((output / "bad-response.failure.json").read_text(encoding="utf-8"))
+    assert failure["raw_samples"][0][0] == 1.9
+    assert "task_id" not in failure
+    assert not (output / "bad-response.npz").exists()
+    assert not (output / "bad-response.json").exists()
+
+
+def test_submit_one_existing_response_stops_before_client_creation(tmp_path, monkeypatch):
+    matrix_path = tmp_path / "matrix.npz"
+    np.savez_compressed(matrix_path, hardware_matrix=np.zeros((49, 49), dtype=np.int8))
+    output = tmp_path / "responses"
+    output.mkdir()
+    (output / "already.npz").write_bytes(b"prior")
+    monkeypatch.setattr(
+        "GEFcom2014.models.QBM_VAE.submit_kaiwu_sampling.KaiwuClient",
+        lambda **kwargs: pytest.fail("SDK client must not be constructed"),
+    )
+    with pytest.raises(RuntimeError, match="refusing duplicate"):
+        submit_one(matrix_path, "already", output, 10,
+                   checkpoint_dir=tmp_path / "checkpoints", task_name="task-already")
 
 
 def test_quantized_sa_uses_matrix_beta_and_records_beta_scales(tmp_path, monkeypatch):

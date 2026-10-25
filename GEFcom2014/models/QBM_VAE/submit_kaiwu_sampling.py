@@ -12,6 +12,7 @@ import hashlib
 import importlib
 import json
 import os
+import re
 from pathlib import Path
 
 import numpy as np
@@ -22,7 +23,16 @@ from .kaiwu_adapter import (
     kaiwu_sdk_versions,
     matrix_sha256,
     validate_hardware_matrix,
+    validate_raw_hardware_spins,
     validate_sampling_reads,
+)
+
+
+FROZEN_TASK_AUDIT_FIELDS = (
+    "protocol_sha256", "model_checkpoint_sha256", "preparation_manifest_sha256",
+    "protocol_version", "hardware_matrix_path", "hardware_matrix_file_sha256",
+    "source_problem_path", "source_problem_sha256",
+    "reference_sample_path", "reference_sample_sha256", "reference_sampler",
 )
 
 
@@ -43,6 +53,63 @@ def load_matrix(matrix_file):
     return matrix, actual_hash
 
 
+def _json_safe(value):
+    if isinstance(value, np.ndarray):
+        return _json_safe(value.tolist())
+    if isinstance(value, np.generic):
+        return _json_safe(value.item())
+    if isinstance(value, dict):
+        return {str(key): _json_safe(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_json_safe(item) for item in value]
+    if isinstance(value, complex):
+        return {"complex_repr": repr(value)}
+    if value is None or isinstance(value, (str, int, float, bool)):
+        return value
+    return repr(value)
+
+
+def _write_failure_evidence(output_dir, instance_id, task_name, matrix_hash,
+                            stage, num_reads, hardware_gain, started_at,
+                            error, raw_samples=None):
+    """Persist known response/error evidence without promoting it to results."""
+    output_dir = Path(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    path = output_dir / (str(instance_id) + ".failure.json")
+    if path.exists():
+        raise RuntimeError("Failure evidence already exists; refusing to overwrite: %s" % path)
+    message = re.sub(
+        r"(?i)(user[_ -]?id|sdk[_ -]?code|password|token|authorization)\s*[:=]\s*\S+",
+        r"\1=[REDACTED]", str(error),
+    )
+    payload = {
+        "status": "invalid_or_incomplete_sdk_response",
+        "instance_id": str(instance_id),
+        "task_name": str(task_name),
+        "matrix_sha256": str(matrix_hash),
+        "stage": str(stage),
+        "requested_reads": int(num_reads),
+        "hardware_gain": None if hardware_gain is None else float(hardware_gain),
+        "started_at": started_at,
+        "error_type": type(error).__name__,
+        "error": message,
+        "hardware_claim": False,
+        "physical_platform_used": False,
+    }
+    if raw_samples is not None:
+        try:
+            raw = np.asarray(raw_samples)
+            payload["raw_samples"] = _json_safe(raw)
+            payload["raw_samples_dtype"] = str(raw.dtype)
+            payload["raw_samples_shape"] = list(raw.shape)
+        except Exception:
+            payload["raw_samples_repr"] = repr(raw_samples)
+    with path.open("x", encoding="utf-8") as handle:
+        json.dump(payload, handle, indent=2, allow_nan=True)
+        handle.write("\n")
+    return path
+
+
 def submit_one(
     matrix_file,
     instance_id,
@@ -55,6 +122,7 @@ def submit_one(
     hardware_gain=None,
     wait=True,
     interval=1,
+    frozen_task=None,
 ):
     num_reads = validate_sampling_reads(num_reads)
     if checkpoint_dir is None:
@@ -63,24 +131,46 @@ def submit_one(
         )
     matrix, matrix_hash = load_matrix(matrix_file)
     task_name = task_name or build_task_name(instance_id, matrix_hash)
-    checkpoint_path = (Path(checkpoint_dir).resolve() / task_name)
-    checkpoint_path.mkdir(parents=True, exist_ok=True)
-    client = KaiwuClient(project_no=project_no, wait=wait, interval=interval)
-    kaiwu_common = getattr(client._kaiwu, "common", None)
-    if kaiwu_common is None:
-        kaiwu_common = importlib.import_module("kaiwu.common")
-    checkpoint_manager = getattr(kaiwu_common, "CheckpointManager", None)
-    if checkpoint_manager is None:
-        raise RuntimeError(
-            "Kaiwu SDK does not expose common.CheckpointManager; cannot isolate task checkpoints"
-        )
-    checkpoint_manager.save_dir = str(checkpoint_path)
-    submitted_at = datetime.now(timezone.utc).isoformat()
-    result = client.sample_hardware_matrix(
-        matrix, num_reads=num_reads, task_name=task_name
-    )
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
+    output_path = output_dir / (str(instance_id) + ".npz")
+    audit_path = output_dir / (str(instance_id) + ".json")
+    if output_path.exists() or audit_path.exists():
+        raise RuntimeError("Response artifact already exists; refusing duplicate submit or overwrite")
+    checkpoint_path = (Path(checkpoint_dir).resolve() / task_name)
+    if checkpoint_path.exists() and any(checkpoint_path.iterdir()):
+        raise RuntimeError("Task checkpoint directory is non-empty; manual review required")
+    checkpoint_path.mkdir(parents=True, exist_ok=True)
+    submitted_at = datetime.now(timezone.utc).isoformat()
+    try:
+        client = KaiwuClient(project_no=project_no, wait=wait, interval=interval)
+        kaiwu_common = getattr(client._kaiwu, "common", None)
+        if kaiwu_common is None:
+            kaiwu_common = importlib.import_module("kaiwu.common")
+        checkpoint_manager = getattr(kaiwu_common, "CheckpointManager", None)
+        if checkpoint_manager is None:
+            raise RuntimeError(
+                "Kaiwu SDK does not expose common.CheckpointManager; cannot isolate task checkpoints"
+            )
+        checkpoint_manager.save_dir = str(checkpoint_path)
+        result = client.sample_hardware_matrix(
+            matrix, num_reads=num_reads, task_name=task_name
+        )
+        samples = validate_raw_hardware_spins(
+            result["samples"], num_reads, matrix.shape[0]
+        )
+    except Exception as exc:
+        raw_samples = getattr(exc, "raw_samples", None)
+        if raw_samples is None and "result" in locals() and isinstance(result, dict):
+            raw_samples = result.get("samples")
+        failure_path = _write_failure_evidence(
+            output_dir, instance_id, task_name, matrix_hash, stage,
+            num_reads, hardware_gain, submitted_at, exc, raw_samples,
+        )
+        raise RuntimeError(
+            "Kaiwu call failed or returned invalid data; batch must stop without retry. "
+            "Evidence: %s" % failure_path
+        ) from exc
     metadata = result["metadata"]
     sdk_version = str(
         getattr(client._kaiwu, "__version__", "unknown")
@@ -88,11 +178,10 @@ def submit_one(
     sdk_versions = kaiwu_sdk_versions(client._kaiwu)
     platform_backend = "kaiwu.cim.CIMOptimizer"
     completed_at = datetime.now(timezone.utc).isoformat()
-    returned_reads = int(np.asarray(result["samples"]).shape[0])
-    output_path = output_dir / (str(instance_id) + ".npz")
+    returned_reads = int(samples.shape[0])
     np.savez_compressed(
         output_path,
-        samples=np.asarray(result["samples"], dtype=np.int8),
+        samples=samples,
         instance_id=np.asarray(instance_id),
         task_id=np.asarray(metadata.get("task_id", "")),
         task_name=np.asarray(metadata.get("task_name", task_name)),
@@ -155,6 +244,10 @@ def submit_one(
         "response_path": str(output_path.resolve()),
         "hardware_metadata_complete": False,
     }
+    # Persist provenance in the first audit, before returning to the driver.
+    # A crash before its waiting marker must not leave an unusable base audit.
+    audit.update({key: frozen_task[key] for key in FROZEN_TASK_AUDIT_FIELDS
+                  if frozen_task and frozen_task.get(key)})
     # Validate the NPZ contents before promoting the audit flags.  A mock
     # client, incomplete metadata, malformed samples, or any hash mismatch
     # leaves the audit explicitly non-physical.
@@ -166,7 +259,8 @@ def submit_one(
         if strict_response_record_valid(candidate):
             audit.update(candidate)
             audit["hardware_metadata_complete"] = True
-    audit_path = output_dir / (str(instance_id) + ".json")
+    if audit_path.exists():
+        raise RuntimeError("Response audit already exists; refusing to overwrite: %s" % audit_path)
     audit_path.write_text(json.dumps(audit, indent=2), encoding="utf-8")
     return output_path, audit_path, audit
 

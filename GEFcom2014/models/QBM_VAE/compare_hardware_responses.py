@@ -30,6 +30,11 @@ def response_statistics(h, j, samples):
         "magnetization": samples.mean(axis=0),
         "edge_moments": edge_moments,
         "beta_eff": calibration["beta_eff"],
+        "beta_eff_grid_min": calibration["beta_grid_min"],
+        "beta_eff_grid_max": calibration["beta_grid_max"],
+        "beta_eff_grid_boundary": calibration["grid_boundary"],
+        "beta_eff_fit_loss": calibration["pseudolikelihood_nll"],
+        "beta_eff_status": calibration["beta_eff_status"],
         "unique_state_fraction": float(
             np.unique(samples, axis=0).shape[0] / samples.shape[0]
         ),
@@ -71,6 +76,16 @@ def compare_response_pair(h, j, reference_samples, candidate_samples):
         "edge_moment_mae": float(edge_difference.mean()) if edge_difference.size else 0.0,
         "reference_beta_eff": float(reference["beta_eff"]),
         "candidate_beta_eff": float(candidate["beta_eff"]),
+        "reference_beta_eff_grid_min": float(reference["beta_eff_grid_min"]),
+        "reference_beta_eff_grid_max": float(reference["beta_eff_grid_max"]),
+        "reference_beta_eff_grid_boundary": bool(reference["beta_eff_grid_boundary"]),
+        "reference_beta_eff_fit_loss": float(reference["beta_eff_fit_loss"]),
+        "reference_beta_eff_status": reference["beta_eff_status"],
+        "candidate_beta_eff_grid_min": float(candidate["beta_eff_grid_min"]),
+        "candidate_beta_eff_grid_max": float(candidate["beta_eff_grid_max"]),
+        "candidate_beta_eff_grid_boundary": bool(candidate["beta_eff_grid_boundary"]),
+        "candidate_beta_eff_fit_loss": float(candidate["beta_eff_fit_loss"]),
+        "candidate_beta_eff_status": candidate["beta_eff_status"],
         "beta_eff_difference": float(
             candidate["beta_eff"] - reference["beta_eff"]
         ),
