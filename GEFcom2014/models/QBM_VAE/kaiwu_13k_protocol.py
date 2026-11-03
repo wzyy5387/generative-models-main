@@ -355,7 +355,7 @@ def aggregate_gain_metrics(response_records, recompute=False, prediction_inputs=
             "magnetization_mae": float(np.mean([row["magnetization_mae"] for row in metrics])),
             "unique_state_fraction": float(np.mean([row["unique_state_fraction"] for row in metrics])),
             "read_convergence_diagnostics": [
-                {"instance_id": record["instance_id"],
+                {"instance_id": record.get("instance_id"),
                  **metric.get("read_convergence_diagnostics", {})}
                 for record, metric in zip(records, metrics)
                 if metric.get("read_convergence_diagnostics")

@@ -93,8 +93,14 @@ def _output_hashes(job, bundle):
             matches = list(out.glob("*_{}_{}.pickle".format(job["n_scenarios"], split)))
             if len(matches) != 1:
                 raise ValueError("Expected one %s scenario file in %s" % (split, out))
-            with matches[0].open("rb") as handle:
-                samples = np.asarray(pickle.load(handle), dtype=np.float64)
+            try:
+                with matches[0].open("rb") as handle:
+                    samples = np.asarray(pickle.load(handle), dtype=np.float64)
+            except (pickle.UnpicklingError, EOFError, AttributeError, TypeError,
+                    ValueError, OSError, OverflowError) as exc:
+                raise ValueError(
+                    "Invalid or corrupted completed scenario output: %s" % matches[0]
+                ) from exc
             expected = (len(arrays["y_" + split.lower()]) * 24, job["n_scenarios"])
             if samples.shape != expected or not np.isfinite(samples).all():
                 raise ValueError("Invalid %s scenario matrix in %s; expected %s" % (split, out, expected))
