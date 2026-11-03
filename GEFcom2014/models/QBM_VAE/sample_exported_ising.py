@@ -11,6 +11,7 @@ import numpy as np
 
 from GEFcom2014.models.QBM_VAE.samplers import build_sampler
 from GEFcom2014.models.QBM_VAE.kaiwu_adapter import (
+    ENERGY_CONVENTION,
     normalize_hardware_spins,
     validate_hardware_matrix,
     validate_sampling_reads,
@@ -47,8 +48,18 @@ def main():
                         % instance["id"]
                     )
                 hardware_matrix = validate_hardware_matrix(problem["hardware_matrix"])
+                convention = str(np.asarray(problem.get(
+                    "hardware_energy_convention", np.asarray(""))).reshape(-1)[0])
+                if convention != ENERGY_CONVENTION:
+                    raise ValueError(
+                        "Quantized matrix lacks the current Kaiwu energy convention; "
+                        "re-export from frozen float h/J"
+                    )
                 h = np.zeros(hardware_matrix.shape[0], dtype=np.float64)
-                j = -2.0 * hardware_matrix.astype(np.float64)
+                # Model samplers minimize -0.5*s.T@J@s. With SDK coupling K,
+                # choose J=+2K so local SA minimizes -u.T@K@u, exactly matching
+                # Kaiwu's hamiltonian(K,u)=-u.T@K@u.
+                j = 2.0 * hardware_matrix.astype(np.float64)
                 hardware_gain = float(np.asarray(problem["hardware_gain"]).reshape(-1)[0])
                 if hardware_gain <= 0:
                     raise ValueError("Hardware gain must be positive")
@@ -104,6 +115,7 @@ def main():
             "backend": str(result.metadata.get("backend", args.backend)),
             "job_id": "local_%s" % args.backend,
             "matrix_space": args.matrix_space,
+            "energy_convention": ENERGY_CONVENTION if args.matrix_space == "hardware-quantized" else "logical_model_ising",
             "hardware_claim": False,
             "physical_platform_used": False,
             "instance_id": str(instance["id"]),
@@ -123,6 +135,7 @@ def main():
                     "hardware_matrix_sha256": np.asarray(
                         instance.get("hardware_matrix_sha256", "")
                     ),
+                    "hardware_energy_convention": np.asarray(ENERGY_CONVENTION),
                     "source_problem_sha256": np.asarray(
                         hashlib.sha256(problem_path.read_bytes()).hexdigest()
                     ),

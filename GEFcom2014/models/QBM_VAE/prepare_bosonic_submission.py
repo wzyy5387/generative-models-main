@@ -13,6 +13,7 @@ from pathlib import Path
 import numpy as np
 
 from .kaiwu_adapter import (
+    ENERGY_CONVENTION,
     HARDWARE_N_BITS,
     INT8_MAX,
     INT8_MIN,
@@ -53,6 +54,8 @@ def validate_payload(payload, expected_id=None):
     hardware_matrix = payload.get("hardware_matrix")
     hardware_stats = None
     if hardware_matrix is not None:
+        if payload.get("hardware_energy_convention") != ENERGY_CONVENTION:
+            raise ValueError("Kaiwu hardware payload uses an unsupported energy convention")
         if int(payload.get("logical_n_bits", h.size)) != LOGICAL_N_BITS:
             raise ValueError("Kaiwu payload must declare logical_n_bits=48")
         if int(payload.get("hardware_n_bits", 0)) != HARDWARE_N_BITS:
@@ -63,7 +66,7 @@ def validate_payload(payload, expected_id=None):
         expected_hash = payload.get("hardware_matrix_sha256")
         if expected_hash != matrix_sha256(matrix):
             raise ValueError("Hardware matrix SHA-256 mismatch")
-        hardware_edges = np.triu(np.abs(matrix) > 0, k=1)
+        hardware_edges = np.triu(np.abs(matrix.astype(np.int16)) > 0, k=1)
         hardware_stats = {
             "logical_n_bits": LOGICAL_N_BITS,
             "hardware_n_bits": HARDWARE_N_BITS,
@@ -72,7 +75,7 @@ def validate_payload(payload, expected_id=None):
             "hardware_gain": float(payload["hardware_gain"]),
             "hardware_n_bits_declared": int(payload["hardware_n_bits"]),
             "clipping": bool(payload.get("quantization_audit", {}).get("clipping", False)),
-            "max_abs_integer": int(np.abs(matrix).max()),
+            "max_abs_integer": int(np.abs(matrix.astype(np.int16)).max()),
         }
     seen_edges = set()
     coupling_values = []
@@ -317,6 +320,10 @@ def prepare_submission(
                 matrix_from_file = validate_hardware_matrix(
                     matrix_archive["hardware_matrix"]
                 )
+                convention = str(np.asarray(matrix_archive.get(
+                    "hardware_energy_convention", np.asarray(""))).reshape(-1)[0])
+                if convention != ENERGY_CONVENTION:
+                    raise ValueError("Hardware matrix file has an unsupported energy convention")
             if matrix_sha256(matrix_from_file) != payload["hardware_matrix_sha256"]:
                 raise ValueError(
                     "Hardware matrix file does not match payload hash for %s"
@@ -338,6 +345,7 @@ def prepare_submission(
 
     schema = {
         "protocol_sha256": protocol_sha256,
+        "hardware_energy_convention": ENERGY_CONVENTION if hardware_gains else None,
         "required": {
             "instance_id": "must match the submitted instance",
             "samples": "2-D array with hardware_n_bits columns, using {-1,+1} or {0,1}",
@@ -382,6 +390,7 @@ def prepare_submission(
         "source_manifest_sha256": sha256_file(source_manifest),
         "protocol_version": protocol_version,
         "protocol_sha256": protocol_sha256,
+        "hardware_energy_convention": ENERGY_CONVENTION if hardware_gains else None,
         "requested_reads_per_instance": int(requested_reads),
         "hardware_gain": next(iter(hardware_gains)) if hardware_gains else None,
         "n_instances": len(records),

@@ -18,6 +18,7 @@ import numpy as np
 
 from .kaiwu_13k_protocol import load_protocol, validate_quality_policy, prediction_quality_mode
 from .kaiwu_adapter import (build_task_name, matrix_sha256,
+                             ENERGY_CONVENTION,
                              official_task_query_capability,
                              quantize_hardware_matrix, validate_hardware_matrix)
 from .prepare_bosonic_submission import sha256_file, resolve_repo_path
@@ -56,6 +57,9 @@ def _validate_preparation_identity(preparation, protocol):
         return
     payload = json.loads(manifest_path.read_text(encoding="utf-8"))
     prediction_mode = prediction_quality_mode(protocol.get("gain_selection", {}).get("quality_gate"))
+    declared_convention = protocol.get("hardware", {}).get("energy_convention")
+    if declared_convention and declared_convention != ENERGY_CONVENTION:
+        raise RuntimeError("Protocol declares an unsupported Kaiwu energy convention")
     if prediction_mode and payload.get("protocol_version") != protocol.get("protocol_version"):
         raise RuntimeError("Preparation directory protocol_version does not match protocol JSON")
     protocol_path = resolve_repo_path(protocol.get("_path", "")) if protocol.get("_path") else None
@@ -86,12 +90,15 @@ def _vs_tasks(preparation, protocol=None):
     reference_manifest = Path(preparation) / "quality_reference_manifest.json"
     policy = (protocol or {}).get("gain_selection", {}).get("quality_gate", {})
     prediction_mode = prediction_quality_mode(policy)
+    strict_energy_convention = (protocol or {}).get("hardware", {}).get("energy_convention") == ENERGY_CONVENTION
     if prediction_mode and not reference_manifest.is_file():
         raise FileNotFoundError("New VS quality policy requires quality_reference_manifest.json")
     if reference_manifest.is_file():
         payload = json.loads(reference_manifest.read_text(encoding="utf-8"))
         if prediction_mode and payload.get("protocol_version") != (protocol or {}).get("protocol_version"):
             raise ValueError("Quality reference manifest protocol_version mismatch")
+        if strict_energy_convention and payload.get("hardware_energy_convention") != ENERGY_CONVENTION:
+            raise ValueError("Quality reference manifest uses a stale energy convention")
         if prediction_mode and payload.get("protocol_sha256") != identity.get("protocol_sha256"):
             raise ValueError("Quality reference manifest protocol_sha256 mismatch")
         if prediction_mode and (payload.get("hardware_claim") is not False
@@ -115,6 +122,8 @@ def _vs_tasks(preparation, protocol=None):
             raise ValueError("VS submission manifest does not match the protocol")
         if payload.get("protocol_version") != (protocol or {}).get("protocol_version"):
             raise ValueError("VS submission package protocol_version mismatch")
+        if strict_energy_convention and payload.get("hardware_energy_convention") != ENERGY_CONVENTION:
+            raise ValueError("VS submission package has a stale or missing energy convention")
         if prediction_mode and payload.get("protocol_sha256") != identity.get("protocol_sha256"):
             raise ValueError("VS submission package protocol_sha256 mismatch")
         expected_reads = int((protocol or {}).get("hardware", {}).get("reads_per_instance", 100))
@@ -128,6 +137,8 @@ def _vs_tasks(preparation, protocol=None):
             platform_payload = json.loads(payload_path.read_text(encoding="utf-8"))
             if prediction_mode and platform_payload.get("protocol_version") != (protocol or {}).get("protocol_version"):
                 raise ValueError("VS payload protocol_version mismatch")
+            if strict_energy_convention and platform_payload.get("hardware_energy_convention") != ENERGY_CONVENTION:
+                raise ValueError("VS payload has a stale or missing energy convention")
             if prediction_mode and platform_payload.get("protocol_sha256") != identity.get("protocol_sha256"):
                 raise ValueError("VS payload protocol_sha256 mismatch")
             payload_task_name = platform_payload.get("task_name")
@@ -150,6 +161,7 @@ def _vs_tasks(preparation, protocol=None):
                           "date": str(item["date"]),
                           "matrix": matrix, "matrix_sha256": item["hardware_matrix_sha256"],
                           "hardware_matrix_path": str(matrix),
+                           "hardware_energy_convention": platform_payload.get("hardware_energy_convention", ""),
                           "source_problem_path": platform_payload.get("source_problem_path", ""),
                           "source_problem_sha256": platform_payload.get("source_problem_sha256", ""),
                           "reads": int(payload["requested_reads_per_instance"])}
@@ -263,7 +275,8 @@ def validate_vs_execution_order(path, tasks, protocol_sha256, preparation_manife
 def _task_expected(task):
     return {key: task[key] for key in
             ("protocol_version", "stage", "instance_id", "gain", "matrix_sha256", "requested_reads", "task_name",
-             "protocol_sha256", "model_checkpoint_sha256", "preparation_manifest_sha256",
+                "protocol_sha256", "model_checkpoint_sha256", "preparation_manifest_sha256",
+                "hardware_energy_convention",
              "hardware_matrix_path", "hardware_matrix_file_sha256",
              "source_problem_path", "source_problem_sha256",
              "reference_sample_path", "reference_sample_sha256", "reference_sampler")
@@ -442,11 +455,15 @@ def _validate_execution_limits(tasks):
     """Validate every frozen matrix; SPQC-550 has no guessed edge cap."""
     checked = set()
     for item in tasks:
+        if item.get("hardware_energy_convention") != ENERGY_CONVENTION:
+            raise RuntimeError("Real execution requires the corrected task energy convention")
         key = str(item["manifest"])
         if key in checked:
             continue
         checked.add(key)
         payload = json.loads(Path(item["manifest"]).read_text(encoding="utf-8"))
+        if payload.get("hardware_energy_convention") != ENERGY_CONVENTION:
+            raise RuntimeError("Real execution requires the corrected manifest energy convention")
         limits = payload.get("platform_limits_checked", {})
         if limits.get("int8_coefficient_range") != [-128, 127]:
             raise RuntimeError("Real execution requires verified int8 coefficient range")
@@ -462,6 +479,10 @@ def _validate_execution_limits(tasks):
             path = Path(item["manifest"]).parent / instance["hardware_matrix"]
             with np.load(path, allow_pickle=False) as archive:
                 matrix = validate_hardware_matrix(archive["hardware_matrix"], 49)
+                convention = str(np.asarray(archive.get(
+                    "hardware_energy_convention", np.asarray(""))).reshape(-1)[0])
+            if convention != ENERGY_CONVENTION:
+                raise RuntimeError("Real execution refuses a stale-sign or unmarked hardware matrix")
             if matrix_sha256(matrix) != instance.get("hardware_matrix_sha256"):
                 raise RuntimeError("Frozen matrix SHA-256 mismatch")
 
@@ -764,17 +785,44 @@ def _test_source_manifest(preparation):
 
 
 def _build_test_manifest(preparation, selected_gain, protocol_id, protocol=None):
+    protocol = protocol or {}
+    energy_convention = protocol.get("hardware", {}).get("energy_convention")
+    if energy_convention != ENERGY_CONVENTION:
+        raise RuntimeError("TEST package requires the frozen corrected energy convention")
+    identity = _preparation_identity(preparation, protocol)
+    if not identity.get("protocol_sha256"):
+        raise RuntimeError("TEST package requires a hash-bound protocol file")
     source = _test_source_manifest(preparation)
+    source_sha256 = sha256_file(source)
+    preparation_manifest = Path(preparation) / "preparation_manifest.json"
+    if preparation_manifest.is_file():
+        frozen_preparation = json.loads(preparation_manifest.read_text(encoding="utf-8"))
+        expected_source_hash = frozen_preparation.get("manifest_hashes", {}).get("test_logical_manifest")
+        if expected_source_hash and expected_source_hash != source_sha256:
+            raise RuntimeError("Frozen TEST source manifest hash does not match preparation identity")
     out = Path(preparation) / ("submission_test_gain_%d" % int(selected_gain)) / "package"
     manifest_path = out / "submission_manifest.json"
     if manifest_path.exists():
         existing = json.loads(manifest_path.read_text(encoding="utf-8"))
         if (existing.get("hardware_gain") != float(selected_gain)
-                or existing.get("source_manifest_sha256") != sha256_file(source)
-                or existing.get("protocol_version") != protocol_id):
+                or existing.get("source_manifest_sha256") != source_sha256
+                or existing.get("protocol_version") != protocol_id
+                or existing.get("protocol_sha256") != identity["protocol_sha256"]
+                or existing.get("hardware_energy_convention") != energy_convention
+                or existing.get("model_checkpoint_sha256") != identity.get("model_checkpoint_sha256", "")
+                or existing.get("preparation_manifest_sha256") != identity.get("preparation_manifest_sha256", "")):
             raise RuntimeError("Existing TEST manifest is immutable and does not match the frozen gain")
         return manifest_path
     source_items = json.loads(source.read_text(encoding="utf-8"))
+    # Validate every logical source identity before creating package files.
+    for item in source_items:
+        payload_path = resolve_repo_path(item["platform_payload"])
+        payload = json.loads(payload_path.read_text(encoding="utf-8"))
+        if (payload.get("instance_id") != item.get("id") or item.get("split") != "TEST"
+                or payload.get("protocol_version") != protocol_id
+                or item.get("protocol_sha256") != identity["protocol_sha256"]
+                or payload.get("protocol_sha256") != identity["protocol_sha256"]):
+            raise RuntimeError("TEST source manifest/payload identity or protocol hash mismatch")
     out.joinpath("payloads").mkdir(parents=True, exist_ok=True)
     out.joinpath("hardware_matrices").mkdir(parents=True, exist_ok=True)
     records = []
@@ -785,9 +833,6 @@ def _build_test_manifest(preparation, selected_gain, protocol_id, protocol=None)
     for item in source_items:
         payload_path = resolve_repo_path(item["platform_payload"])
         payload = json.loads(payload_path.read_text(encoding="utf-8"))
-        if (payload.get("instance_id") != item["id"] or item.get("split") != "TEST"
-                or payload.get("protocol_version") != protocol_id):
-            raise RuntimeError("TEST source manifest/payload mismatch")
         h = np.asarray(payload["h"], dtype=float)
         j = np.zeros((h.size, h.size), dtype=float)
         for edge in payload.get("couplings", []):
@@ -800,9 +845,12 @@ def _build_test_manifest(preparation, selected_gain, protocol_id, protocol=None)
         matrix_path = out / "hardware_matrices" / matrix_name
         payload_out = out / "payloads" / payload_name
         np.savez_compressed(matrix_path, hardware_matrix=matrix,
+                            hardware_energy_convention=np.asarray(ENERGY_CONVENTION),
                             matrix_sha256=np.asarray(matrix_sha256(matrix)),
                             hardware_gain=np.asarray(selected_gain))
         payload.update({"hardware_matrix": matrix.tolist(),
+                        "hardware_energy_convention": ENERGY_CONVENTION,
+                        "protocol_sha256": identity["protocol_sha256"],
                         "hardware_matrix_file": "hardware_matrices/" + matrix_name,
                         "hardware_matrix_sha256": matrix_sha256(matrix),
                         "hardware_gain": float(selected_gain),
@@ -814,6 +862,10 @@ def _build_test_manifest(preparation, selected_gain, protocol_id, protocol=None)
                         "hardware_claim": False, "physical_platform_used": False})
         payload_out.write_text(json.dumps(payload, indent=2), encoding="utf-8")
         records.append({"instance_id": item["id"], "split": "TEST",
+                        "hardware_energy_convention": energy_convention,
+                        "protocol_sha256": identity["protocol_sha256"],
+                        "model_checkpoint_sha256": identity.get("model_checkpoint_sha256", ""),
+                        "preparation_manifest_sha256": identity.get("preparation_manifest_sha256", ""),
                         "payload": "payloads/" + payload_name,
                         "payload_sha256": sha256_file(payload_out),
                         "hardware_matrix": "hardware_matrices/" + matrix_name,
@@ -826,6 +878,10 @@ def _build_test_manifest(preparation, selected_gain, protocol_id, protocol=None)
                         "max_abs_coefficient": int(np.abs(matrix).max())})
     manifest = {"schema_version": 1, "stage": "test-evaluation", "split": "TEST",
                 "protocol_version": protocol_id,
+                "protocol_sha256": identity["protocol_sha256"],
+                "hardware_energy_convention": energy_convention,
+                "model_checkpoint_sha256": identity.get("model_checkpoint_sha256", ""),
+                "preparation_manifest_sha256": identity.get("preparation_manifest_sha256", ""),
                 "hardware_claim": False, "physical_platform_used": False,
                 "frozen": True, "hardware_gain": float(selected_gain),
                 "requested_reads_per_instance": expected_reads, "n_instances": len(records),
@@ -850,12 +906,65 @@ def planned_tasks(stage, preparation, output_dir, protocol=None, offline_simulat
                                          (protocol or {}).get("protocol_version", "fa-bm-vae-kaiwu-13k-v1"),
                                          protocol)
     payload = json.loads(manifest_path.read_text(encoding="utf-8"))
-    return [{"gain": float(payload["hardware_gain"]), "manifest": manifest_path,
-             "stage": "test", "task_name": (json.loads((manifest_path.parent / item["payload"]).read_text(encoding="utf-8")).get("task_name") if item.get("payload") else None),
-             "instance_id": item["instance_id"],
-             "matrix": manifest_path.parent / item["hardware_matrix"],
-             "matrix_sha256": item["hardware_matrix_sha256"],
-             "reads": int(payload["requested_reads_per_instance"])} for item in payload["instances"]]
+    identity = _preparation_identity(preparation, protocol or {})
+    convention = (protocol or {}).get("hardware", {}).get("energy_convention")
+    if (payload.get("split") != "TEST"
+            or payload.get("protocol_version") != (protocol or {}).get("protocol_version")
+            or payload.get("protocol_sha256") != identity.get("protocol_sha256")
+            or payload.get("model_checkpoint_sha256") != identity.get("model_checkpoint_sha256", "")
+            or payload.get("preparation_manifest_sha256") != identity.get("preparation_manifest_sha256", "")
+            or payload.get("hardware_energy_convention") != convention
+            or convention != ENERGY_CONVENTION
+            or payload.get("source_manifest_sha256") != sha256_file(_test_source_manifest(preparation))):
+        raise RuntimeError("TEST submission manifest is missing, stale, or bound to different frozen inputs")
+    tasks = []
+    for item in payload.get("instances", []):
+        matrix_path = manifest_path.parent / item["hardware_matrix"]
+        payload_path = manifest_path.parent / item["payload"]
+        if (item.get("split") != "TEST"
+                or item.get("hardware_energy_convention") != convention
+                or item.get("protocol_sha256") != identity.get("protocol_sha256")
+                or item.get("model_checkpoint_sha256") != identity.get("model_checkpoint_sha256", "")
+                or item.get("preparation_manifest_sha256") != identity.get("preparation_manifest_sha256", "")
+                or not payload_path.is_file()
+                or sha256_file(payload_path) != item.get("payload_sha256")
+                or sha256_file(matrix_path) != item.get("hardware_matrix_sha256_file")):
+            raise RuntimeError("TEST task manifest entry is missing or has changed frozen artifacts")
+        task_payload = json.loads(payload_path.read_text(encoding="utf-8"))
+        if (task_payload.get("instance_id") != item.get("instance_id")
+                or task_payload.get("split") != "TEST"
+                or task_payload.get("protocol_version") != payload.get("protocol_version")
+                or task_payload.get("protocol_sha256") != identity.get("protocol_sha256")
+                or task_payload.get("hardware_energy_convention") != convention
+                or task_payload.get("hardware_matrix_sha256") != item.get("hardware_matrix_sha256")):
+            raise RuntimeError("TEST task payload is missing or has a different frozen identity")
+        with np.load(matrix_path, allow_pickle=False) as archive:
+            convention_in_matrix = str(np.asarray(archive.get(
+                "hardware_energy_convention", np.asarray(""))).reshape(-1)[0])
+            matrix = validate_hardware_matrix(archive["hardware_matrix"], 49)
+        if (convention_in_matrix != convention
+                or matrix_sha256(matrix) != item.get("hardware_matrix_sha256")):
+            raise RuntimeError("TEST task matrix is missing or has a different energy convention/hash")
+        expected_task_name = build_task_name(
+            item["instance_id"], item["hardware_matrix_sha256"],
+            protocol_id=payload["protocol_version"], stage="test-evaluation",
+            gain=payload["hardware_gain"],
+        )
+        if task_payload.get("task_name") != expected_task_name:
+            raise RuntimeError("TEST task name does not match its frozen matrix identity")
+        tasks.append({"gain": float(payload["hardware_gain"]), "manifest": manifest_path,
+            "stage": "test", "protocol_version": payload["protocol_version"],
+            "protocol_sha256": identity["protocol_sha256"],
+            "model_checkpoint_sha256": identity.get("model_checkpoint_sha256", ""),
+            "preparation_manifest_sha256": identity.get("preparation_manifest_sha256", ""),
+            "hardware_energy_convention": convention, "task_name": expected_task_name,
+            "instance_id": item["instance_id"], "matrix": matrix_path,
+            "matrix_sha256": item["hardware_matrix_sha256"],
+            "hardware_matrix_path": str(matrix_path),
+            "hardware_matrix_file_sha256": item["hardware_matrix_sha256_file"],
+            "reads": int(payload["requested_reads_per_instance"]),
+            "requested_reads": int(payload["requested_reads_per_instance"])})
+    return tasks
 
 
 def run(args):

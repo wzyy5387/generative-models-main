@@ -4,7 +4,7 @@ import json
 import numpy as np
 import pytest
 
-from GEFcom2014.models.QBM_VAE.kaiwu_adapter import matrix_sha256
+from GEFcom2014.models.QBM_VAE.kaiwu_adapter import matrix_sha256, platform_task_name
 from GEFcom2014.models.QBM_VAE.kaiwu_platform_receipt import (
     create_platform_verification,
     validate_platform_verification,
@@ -18,9 +18,12 @@ def _sha(path):
     return hashlib.sha256(path.read_bytes()).hexdigest()
 
 
-def _artifacts(tmp_path, identifier_field="task_id", platform_submitted_at="2026-01-01T00:00:00+00:00"):
+def _artifacts(tmp_path, identifier_field="task_id", platform_submitted_at="2026-01-01T00:00:00+00:00", short_platform_name=False):
     instance = "vs_frozen_000"
     task_name = "official_task_name_000"
+    if short_platform_name:
+        task_name = "frozen_opsd_task_" * 10
+    sdk_name = platform_task_name(task_name) if short_platform_name else task_name
     matrix = np.zeros((49, 49), dtype=np.int8)
     matrix[0, 1] = matrix[1, 0] = 2
     matrix_path = tmp_path / "matrix.npz"
@@ -35,9 +38,10 @@ def _artifacts(tmp_path, identifier_field="task_id", platform_submitted_at="2026
         submitted_at="2026-01-01T00:00:00+00:00", completed_at="2026-01-01T00:00:01+00:00",
         sdk_version="1.0.7", kaiwu_distribution_version="1.4.1",
         kaiwu_module_version="1.0.7", platform_backend="kaiwu.cim.CIMOptimizer",
+        **({"platform_task_name": sdk_name} if short_platform_name else {}),
     )
     record = {
-        identifier_field: "platform-92731", "task_name": task_name,
+        identifier_field: "platform-92731", "task_name": sdk_name,
         "matrix_sha256": matrix_hash, "status": "completed",
         "requested_reads": 4, "returned_reads": 4,
         "submitted_at": platform_submitted_at, "completed_at": "2026-01-01T00:01:00+00:00",
@@ -51,10 +55,11 @@ def _artifacts(tmp_path, identifier_field="task_id", platform_submitted_at="2026
 
 
 @pytest.mark.parametrize("identifier_field", ["task_id", "job_id"])
-def test_manual_platform_receipt_binds_id_matrix_response_and_preserves_raw(tmp_path, identifier_field):
+@pytest.mark.parametrize("short_platform_name", [False, True])
+def test_manual_platform_receipt_binds_id_matrix_response_and_preserves_raw(tmp_path, identifier_field, short_platform_name):
     instance, task_name, matrix_hash, matrix, raw, platform_record, evidence = _artifacts(
         tmp_path, identifier_field=identifier_field,
-        platform_submitted_at="2026-01-01T00:00:05Z")
+        platform_submitted_at="2026-01-01T00:00:05Z", short_platform_name=short_platform_name)
     original_hash = _sha(raw)
     receipt_path = tmp_path / (instance + ".platform_verification.json")
     _, receipt = create_platform_verification(
@@ -94,6 +99,22 @@ def test_manual_platform_receipt_binds_id_matrix_response_and_preserves_raw(tmp_
         "platform_identifier_value": checked["platform_identifier_value"],
     }
     assert strict_response_record_valid(record)
+
+
+def test_platform_receipt_rejects_changed_short_name_in_raw_or_receipt(tmp_path):
+    instance, _, _, matrix, raw, record, evidence = _artifacts(tmp_path, short_platform_name=True)
+    receipt_path = tmp_path / (instance + ".platform_verification.json")
+    _, receipt = create_platform_verification(raw, matrix, record, evidence, "reviewer", receipt_path)
+    receipt["platform_task_name"] = "wrong-platform-task"
+    receipt_path.write_text(json.dumps(receipt), encoding="utf-8")
+    with pytest.raises(ValueError, match="platform_task_name mismatch"):
+        validate_platform_verification(raw, receipt_path)
+    with np.load(raw, allow_pickle=False) as archive:
+        arrays = {key: archive[key] for key in archive.files}
+    arrays["platform_task_name"] = "wrong-platform-task"
+    np.savez(raw, **arrays)
+    with pytest.raises(ValueError, match="does not match frozen task identity"):
+        create_platform_verification(raw, matrix, record, evidence, "reviewer", tmp_path / "wrong.json")
 
 
 def test_platform_receipt_rejects_wrong_matrix_or_response_and_never_overwrites(tmp_path):
@@ -160,9 +181,10 @@ def test_platform_and_client_event_times_are_distinct_and_offsets_parse(tmp_path
 
 
 @pytest.mark.parametrize("identifier_field", ["task_id", "job_id"])
-def test_verified_sidecar_enters_formal_import_without_rewriting_raw_response(tmp_path, identifier_field):
+@pytest.mark.parametrize("short_platform_name", [False, True])
+def test_verified_sidecar_enters_formal_import_without_rewriting_raw_response(tmp_path, identifier_field, short_platform_name):
     instance, task_name, matrix_hash, matrix_path, raw, record_path, evidence = _artifacts(
-        tmp_path, identifier_field=identifier_field)
+        tmp_path, identifier_field=identifier_field, short_platform_name=short_platform_name)
     input_dir = tmp_path / "raw_inputs"
     input_dir.mkdir()
     raw_in_input = input_dir / raw.name
@@ -207,10 +229,11 @@ def test_verified_sidecar_enters_formal_import_without_rewriting_raw_response(tm
 
 
 @pytest.mark.parametrize("identifier_field", ["task_id", "job_id"])
-def test_verified_receipt_is_used_on_resume_without_rewriting_raw_audit(tmp_path, identifier_field):
+@pytest.mark.parametrize("short_platform_name", [False, True])
+def test_verified_receipt_is_used_on_resume_without_rewriting_raw_audit(tmp_path, identifier_field, short_platform_name):
     from GEFcom2014.models.QBM_VAE.run_kaiwu_13k_sampling import _load_audit_records, _load_completed
     instance, task_name, matrix_hash, matrix, raw, platform_record, evidence = _artifacts(
-        tmp_path, identifier_field=identifier_field)
+        tmp_path, identifier_field=identifier_field, short_platform_name=short_platform_name)
     verification = tmp_path / (instance + ".platform_verification.json")
     create_platform_verification(raw, matrix, platform_record, evidence, "reviewer-1", verification)
     raw_hash = _sha(raw)

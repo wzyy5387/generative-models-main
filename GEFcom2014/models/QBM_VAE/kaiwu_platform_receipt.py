@@ -14,7 +14,7 @@ from pathlib import Path
 
 import numpy as np
 
-from .kaiwu_adapter import matrix_sha256, validate_raw_hardware_spins
+from .kaiwu_adapter import matrix_sha256, platform_task_name, validate_raw_hardware_spins
 
 
 def sha256_file(path):
@@ -46,6 +46,16 @@ def _parse_aware_timestamp(value, field):
     if parsed.tzinfo is None or parsed.utcoffset() is None:
         raise ValueError("%s must include a timezone offset" % field)
     return parsed.astimezone(timezone.utc)
+
+
+def _saved_platform_task_name(archive):
+    frozen_name = str(_scalar(archive, "task_name"))
+    if "platform_task_name" not in archive:
+        return frozen_name  # Historical responses used the full frozen name.
+    saved_name = str(_scalar(archive, "platform_task_name"))
+    if saved_name != platform_task_name(frozen_name):
+        raise ValueError("Raw platform_task_name does not match frozen task identity")
+    return saved_name
 
 
 def _same_instant(left, right, field):
@@ -88,6 +98,7 @@ def create_platform_verification(raw_response, matrix_file, platform_record,
         samples = validate_raw_hardware_spins(
             archive["samples"], int(_scalar(archive, "requested_reads")), 49)
         raw_identity = {key: _scalar(archive, key) for key in required if key != "samples"}
+        sdk_task_name = _saved_platform_task_name(archive)
     with np.load(matrix_file, allow_pickle=False) as archive:
         if "hardware_matrix" not in archive:
             raise ValueError("Matrix file lacks hardware_matrix")
@@ -98,7 +109,7 @@ def create_platform_verification(raw_response, matrix_file, platform_record,
         raise ValueError("Raw response and frozen hardware matrix identity differ")
 
     expected = {
-        "task_name": str(raw_identity["task_name"]),
+        "task_name": sdk_task_name,
         "matrix_sha256": calculated_matrix_hash,
         "status": "completed",
         "requested_reads": int(raw_identity["requested_reads"]),
@@ -128,6 +139,7 @@ def create_platform_verification(raw_response, matrix_file, platform_record,
         "task_id": platform_id,
         "platform_identifier_field": platform_id_key,
         "task_name": str(raw_identity["task_name"]),
+        "platform_task_name": sdk_task_name,
         "matrix_sha256": calculated_matrix_hash,
         "matrix_file_path": str(matrix_file),
         "matrix_file_sha256": sha256_file(matrix_file),
@@ -186,6 +198,7 @@ def validate_platform_verification(raw_response, verification_path, expected=Non
     if sha256_file(raw_response) != receipt.get("raw_response_sha256"):
         raise ValueError("Raw response changed after platform verification")
     with np.load(raw_response, allow_pickle=False) as archive:
+        sdk_task_name = _saved_platform_task_name(archive)
         checks = {
             "instance_id": str(_scalar(archive, "instance_id")),
             "task_name": str(_scalar(archive, "task_name")),
@@ -197,6 +210,8 @@ def validate_platform_verification(raw_response, verification_path, expected=Non
         "client_called_at": str(_scalar(archive, "submitted_at")),
         "client_returned_at": str(_scalar(archive, "completed_at")),
         }
+    if receipt.get("platform_task_name", receipt.get("task_name")) != sdk_task_name:
+        raise ValueError("Platform verification platform_task_name mismatch")
     for key, value in checks.items():
         if key in ("client_called_at", "client_returned_at"):
             if not _same_instant(receipt.get(key), value, key):
@@ -224,7 +239,7 @@ def validate_platform_verification(raw_response, verification_path, expected=Non
     if str(platform_id) != str(identifier_value) or str(identifier_value) != str(receipt["task_id"]):
         raise ValueError("Platform verification identifier differs from the original task record")
     platform_fields = {
-        "task_name": receipt["task_name"],
+        "task_name": sdk_task_name,
         "matrix_sha256": receipt["matrix_sha256"],
         "status": "completed",
         "requested_reads": receipt["requested_reads"],

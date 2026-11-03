@@ -25,7 +25,9 @@ from .calibration import fit_effective_temperature, fit_effective_temperature_ps
 from .kaiwu_adapter import (
     KaiwuClient,
     BosonicClient,
+    ENERGY_CONVENTION,
     hardware_matrix_from_ising,
+    model_energy_matrix_from_ising,
     quantize_hardware_matrix,
     normalize_hardware_spins,
 )

@@ -638,7 +638,8 @@ def fit_qbm_vae(nb_epoch, x_LS, y_LS, x_VS, y_VS, x_TEST, y_TEST, model, opt, sa
                 evaluate_test_during_training=False, negative_sampler=None,
                 negative_num_reads=1, negative_sampler_kwargs=None,
                 trajectory_ensemble_size=4, trajectory_energy_weight=0.0,
-                trajectory_variogram_weight=0.0, trajectory_ramp_weight=0.0):
+                trajectory_variogram_weight=0.0, trajectory_ramp_weight=0.0,
+                temperature_schedule_epochs=None):
     device = torch.device("cuda:0" if gpu and torch.cuda.is_available() else "cpu")
     model.to(device)
     model.device = device
@@ -660,12 +661,14 @@ def fit_qbm_vae(nb_epoch, x_LS, y_LS, x_VS, y_VS, x_TEST, y_TEST, model, opt, sa
     )
 
     loss_rows = []
+    validation_history = []
     best_model = None
     best_vs = np.inf
     epochs_without_improvement = 0
     for epoch in range(nb_epoch):
         model.train()
-        epoch_fraction = epoch / max(nb_epoch - 1, 1)
+        schedule_epochs = nb_epoch if temperature_schedule_epochs is None else max(1, int(temperature_schedule_epochs))
+        epoch_fraction = min(epoch / max(schedule_epochs - 1, 1), 1.0)
         temperature = temperature_start + epoch_fraction * (temperature_end - temperature_start)
         current_qbm_weight = qbm_weight * min(1.0, (epoch + 1) / max(warmup_epochs, 1))
         train_total = 0.0
@@ -738,11 +741,19 @@ def fit_qbm_vae(nb_epoch, x_LS, y_LS, x_VS, y_VS, x_TEST, y_TEST, model, opt, sa
         train_loss = train_total / n_train
         loss_rows.append([train_loss, vs_loss.item(), test_loss_value])
         validation_score = vs_components["recon"].item()
+        validation_history.append({
+            "epoch": int(epoch),
+            "vs_reconstruction": float(validation_score),
+            "vs_total": float(vs_loss.item()),
+            "temperature": float(temperature),
+            "qbm_weight": float(current_qbm_weight),
+        })
         if validation_score < best_vs:
             best_vs = validation_score
             best_model = copy.deepcopy(model)
             best_model.selection_epoch = int(epoch)
             best_model.selection_metric = "VS reconstruction"
+            best_model.selection_score = float(validation_score)
             epochs_without_improvement = 0
         else:
             epochs_without_improvement += 1
@@ -767,6 +778,9 @@ def fit_qbm_vae(nb_epoch, x_LS, y_LS, x_VS, y_VS, x_TEST, y_TEST, model, opt, sa
         if epochs_without_improvement >= early_stopping_patience:
             print("Early stopping at epoch %s (best VS reconstruction %.6f)" % (epoch, best_vs))
             break
+    if best_model is None:
+        raise RuntimeError("QBM-VAE did not produce a finite VS-selected checkpoint")
+    best_model.validation_history = validation_history
     return np.asarray(loss_rows), best_model, model
 
 

@@ -25,6 +25,7 @@ INT8_MIN = -128
 INT8_MAX = 127
 MIN_SAMPLING_READS = 10
 MAX_SAMPLING_READS = 2000
+ENERGY_CONVENTION = "kaiwu_sdk_hamiltonian_matches_fa_bm_vae_energy_v1"
 
 
 class KaiwuResponseError(RuntimeError):
@@ -93,14 +94,19 @@ def _validate_logical_ising(h, j, logical_n_bits=LOGICAL_N_BITS):
     return h, j
 
 
-def hardware_matrix_from_ising(h, j, logical_n_bits=LOGICAL_N_BITS):
-    """Return the exact floating-point auxiliary-spin matrix M."""
+def model_energy_matrix_from_ising(h, j, logical_n_bits=LOGICAL_N_BITS):
+    """Return M such that u.T @ M @ u == E_model(s), u=[s,+1]."""
     h, j = _validate_logical_ising(h, j, logical_n_bits)
     matrix = np.zeros((logical_n_bits + 1, logical_n_bits + 1), dtype=np.float64)
     matrix[:logical_n_bits, :logical_n_bits] = -0.5 * j
     matrix[:logical_n_bits, logical_n_bits] = -0.5 * h
     matrix[logical_n_bits, :logical_n_bits] = -0.5 * h
     return matrix
+
+
+def hardware_matrix_from_ising(h, j, logical_n_bits=LOGICAL_N_BITS):
+    """Return SDK coupling K, where hamiltonian(K,u) == E_model(s)."""
+    return -model_energy_matrix_from_ising(h, j, logical_n_bits)
 
 
 def validate_hardware_matrix(matrix, n_bits=None):
@@ -134,8 +140,10 @@ def quantize_hardware_matrix(h, j, hardware_gain, logical_n_bits=LOGICAL_N_BITS)
     """Build and audit one globally-gained, non-clipped int8-compatible matrix."""
     if not np.isfinite(hardware_gain) or hardware_gain <= 0:
         raise ValueError("hardware_gain must be finite and positive")
+    # Rebuild from original float64 h/J; never negate an int8 matrix, where
+    # -128 cannot be represented and silently overflows.
     matrix = hardware_matrix_from_ising(h, j, logical_n_bits)
-    scaled = float(hardware_gain) * matrix
+    scaled = float(hardware_gain) * matrix.astype(np.float64)
     rounded = np.rint(scaled)
     if np.any(rounded < INT8_MIN) or np.any(rounded > INT8_MAX):
         raise OverflowError(
@@ -143,15 +151,18 @@ def quantize_hardware_matrix(h, j, hardware_gain, logical_n_bits=LOGICAL_N_BITS)
             "reduce the global gain and rebuild from the original h,J"
         )
     quantized = validate_hardware_matrix(rounded.astype(np.int16))
+    quantized_wide = quantized.astype(np.int16)
     upper = np.triu(np.ones_like(matrix, dtype=bool), k=1)
     source_nonzero = upper & (np.abs(matrix) > 0.0)
-    quantized_nonzero = upper & (np.abs(quantized) > 0)
+    quantized_nonzero = upper & (np.abs(quantized_wide) > 0)
     source_values = matrix[source_nonzero]
     quantized_values = quantized[source_nonzero].astype(np.float64)
     relative_error = np.linalg.norm(
         quantized_values / float(hardware_gain) - source_values
     ) / max(np.linalg.norm(source_values), 1e-15)
     audit = {
+        "energy_convention": ENERGY_CONVENTION,
+        "matrix_role": "kaiwu_sdk_coupling_K",
         "logical_n_bits": int(logical_n_bits),
         "hardware_n_bits": int(logical_n_bits + 1),
         "auxiliary_spin_index": int(logical_n_bits),
@@ -160,7 +171,7 @@ def quantize_hardware_matrix(h, j, hardware_gain, logical_n_bits=LOGICAL_N_BITS)
         "clipping": False,
         "precision_reducer": False,
         "variable_splitting": False,
-        "max_abs_integer": int(np.abs(quantized).max()),
+        "max_abs_integer": int(np.abs(quantized_wide).max()),
         "nonzero_edges": int(np.count_nonzero(quantized_nonzero)),
         "source_nonzero_coefficients": int(source_values.size),
         "nonzero_quantized_to_zero_fraction": float(
@@ -242,6 +253,20 @@ def build_task_name(instance_id, matrix_hash, run_id=None, protocol_id="fa-bm-va
     return "fa_bm_vae_%s_%s_%s_g%s_%s" % (safe_protocol, safe_stage, safe_instance, gain_part, str(matrix_hash)[:16])
 
 
+def platform_task_name(task_name):
+    """Map a frozen identity to a stable, at-most-32-byte SDK name.
+
+    32 is our conservative naming policy, not a claimed vendor column limit.
+    Keep the full identity in local manifests and response metadata.
+    """
+    name = str(task_name)
+    if not name:
+        raise ValueError("Task name must not be empty")
+    if name.isascii() and len(name) <= 32:
+        return name
+    return "fbv_" + hashlib.sha256(name.encode("utf-8")).hexdigest()[:28]
+
+
 def load_kaiwu_sdk():
     try:
         kaiwu = importlib.import_module("kaiwu")
@@ -291,14 +316,25 @@ class KaiwuClient:
         self.project_no = project_no or os.environ.get("KAIWU_PROJECT_NO")
         self.wait = bool(wait)
         self.interval = int(interval)
-        self._kaiwu, self._optimizer_cls, self._task_mode = load_kaiwu_sdk()
+        # Defer SDK import/client setup until a fully validated matrix reaches
+        # the physical submission boundary. Compatibility inputs can then fail
+        # closed before touching SDK/license state.
+        self._kaiwu = None
+        self._optimizer_cls = None
+        self._task_mode = None
 
-    def sample_hardware_matrix(self, matrix, num_reads, task_name=None):
+    def sample_hardware_matrix(self, matrix, num_reads, task_name=None,
+                               energy_convention=None):
         num_reads = validate_sampling_reads(num_reads)
+        if energy_convention != ENERGY_CONVENTION:
+            raise ValueError("Kaiwu submission requires the frozen corrected energy convention")
         matrix = validate_hardware_matrix(matrix)
+        if self._kaiwu is None:
+            self._kaiwu, self._optimizer_cls, self._task_mode = load_kaiwu_sdk()
         task_name = task_name or build_task_name("matrix", matrix_sha256(matrix))
+        sdk_task_name = platform_task_name(task_name)
         optimizer = self._optimizer_cls(
-            task_name=task_name,
+            task_name=sdk_task_name,
             wait=self.wait,
             interval=self.interval,
             project_no=self.project_no,
@@ -321,6 +357,7 @@ class KaiwuClient:
             "metadata": {
                 "backend": "kaiwu_cim_sampling",
                 "task_name": task_name,
+                "platform_task_name": sdk_task_name,
                 # The public SDK reference documents task_name/matrix identity,
                 # not optimizer.task_id/id. Never infer a platform task ID.
                 "hardware_n_bits": int(matrix.shape[0]),
@@ -329,29 +366,44 @@ class KaiwuClient:
         }
 
     def sample_ising(self, h=None, j=None, num_reads=100, beta=1.0,
-                     matrix=None, task_name=None, **kwargs):
+                     matrix=None, task_name=None, energy_convention=None, **kwargs):
         """Compatibility method for the existing BosonicPlatformSampler.
 
-        The only accepted h,J form is a 49-spin sampler-form encoding of Q:
-        h=0 and j=-2Q. Logical 48-spin h,J is rejected because it has not
+        The only accepted h,J form is a 49-spin sampler-form encoding of K:
+        h=0 and j=+2K. Logical 48-spin h,J is rejected because it has not
         passed the explicit global-gain quantization step.
         """
         if matrix is None:
             if h is None or j is None:
-                raise ValueError("Pass matrix=Q or the 49-spin h=0, j=-2Q form")
+                raise ValueError("Pass matrix=K or the 49-spin h=0, j=+2K form")
             h = np.asarray(h, dtype=np.float64)
             j = np.asarray(j, dtype=np.float64)
             if h.shape != (HARDWARE_N_BITS,) or j.shape != (
                 HARDWARE_N_BITS,
                 HARDWARE_N_BITS,
-            ) or not np.allclose(h, 0.0):
+            ) or not np.isfinite(h).all() or np.any(h != 0.0):
                 raise ValueError(
                     "KaiwuClient refuses logical 48-spin h,J; provide the "
                     "quantized 49x49 hardware matrix"
                 )
-            matrix = -0.5 * j
+            # Keep the conversion in float64 until every matrix property has
+            # been checked. Narrowing first can wrap (e.g. 65536 -> 0) and
+            # make an invalid paid-task input look harmless.
+            matrix = 0.5 * j
+            if not np.isfinite(matrix).all():
+                raise ValueError("49-spin sampler J must be finite")
+            if not np.array_equal(matrix, np.rint(matrix)):
+                raise ValueError("49-spin sampler J must encode exact integer SDK couplings K")
+            if not np.array_equal(matrix, matrix.T):
+                raise ValueError("49-spin sampler J must encode a symmetric SDK matrix")
+            if np.any(np.diag(matrix) != 0.0):
+                raise ValueError("49-spin sampler J must encode a zero-diagonal SDK matrix")
+            if np.any(matrix < INT8_MIN) or np.any(matrix > INT8_MAX):
+                raise ValueError("49-spin sampler J coefficients must encode K in [-128, 127]")
+            matrix = matrix.astype(np.int8)
         result = self.sample_hardware_matrix(
-            matrix, num_reads=num_reads, task_name=task_name
+            matrix, num_reads=num_reads, task_name=task_name,
+            energy_convention=energy_convention,
         )
         samples = result["samples"]
         return {

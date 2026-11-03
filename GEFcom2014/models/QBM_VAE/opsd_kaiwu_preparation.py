@@ -31,8 +31,12 @@ from GEFcom2014.models.QBM_VAE.kaiwu_13k_protocol import (
     load_protocol,
     scenario_metrics,
 )
-from GEFcom2014.models.QBM_VAE.kaiwu_adapter import matrix_sha256
-from GEFcom2014.models.QBM_VAE.kaiwu_adapter import hardware_matrix_from_ising
+from GEFcom2014.models.QBM_VAE.kaiwu_adapter import (
+    ENERGY_CONVENTION,
+    hardware_matrix_from_ising,
+    matrix_sha256,
+    model_energy_matrix_from_ising,
+)
 from GEFcom2014.models.QBM_VAE.ising import ising_energy
 from GEFcom2014.models.QBM_VAE.prepare_bosonic_submission import prepare_submission
 from GEFcom2014.models.QBM_VAE.reconstruct_hardware_scenarios import decode_platform_spins
@@ -301,11 +305,16 @@ def _build_quality_reference_manifest(output_dir, protocol, vs_manifests):
                 j = np.asarray(problem["J"], dtype=np.float64)
             with np.load(matrix_path, allow_pickle=False) as matrix_archive:
                 matrix = np.asarray(matrix_archive["hardware_matrix"], dtype=np.int8)
+                matrix_convention = str(np.asarray(matrix_archive.get(
+                    "hardware_energy_convention", np.asarray(""))).reshape(-1)[0])
+            if matrix_convention != ENERGY_CONVENTION:
+                raise ValueError("Packaged reference matrix has a stale energy convention")
             with np.load(sample_path, allow_pickle=False) as sample:
                 required = ("samples", "hardware_samples", "backend", "matrix_space",
                             "instance_id", "random_seed", "requested_reads", "sweeps",
                             "sampler_beta", "matrix_beta", "logical_beta", "hardware_gain",
-                            "protocol_sha256", "hardware_matrix_sha256", "source_problem_sha256")
+                            "protocol_sha256", "hardware_matrix_sha256", "source_problem_sha256",
+                            "hardware_energy_convention")
                 missing = [key for key in required if key not in sample]
                 if missing:
                     raise ValueError("SA reference lacks provenance fields: %s" % ", ".join(missing))
@@ -326,6 +335,7 @@ def _build_quality_reference_manifest(output_dir, protocol, vs_manifests):
                     or not np.isclose(float(metadata["matrix_beta"]), expected_beta, rtol=0, atol=1e-12)
                     or str(metadata["hardware_matrix_sha256"]) != matrix_sha256(matrix)
                     or str(metadata["source_problem_sha256"]) != sha256_file(problem_path)
+                    or str(metadata["hardware_energy_convention"]) != ENERGY_CONVENTION
                     or str(metadata["protocol_sha256"]) != sha256_file(protocol["_path"])
                     or not np.isclose(float(metadata["logical_beta"]),
                                       float(protocol["gain_selection"]["prediction_evaluation"].get("logical_beta", 1.0)),
@@ -340,6 +350,7 @@ def _build_quality_reference_manifest(output_dir, protocol, vs_manifests):
                 "hardware_matrix_path": str(matrix_path.resolve()),
                 "hardware_matrix_file_sha256": sha256_file(matrix_path),
                 "hardware_matrix_sha256": matrix_sha256(matrix),
+                "hardware_energy_convention": ENERGY_CONVENTION,
                 "reference_sample_path": str(sample_path.resolve()),
                 "reference_sample_sha256": sha256_file(sample_path),
                 "sampler": {"backend": "sa", "matrix_space": "hardware-quantized",
@@ -357,6 +368,7 @@ def _build_quality_reference_manifest(output_dir, protocol, vs_manifests):
     target = Path(output_dir) / "quality_reference_manifest.json"
     _json_dump(target, {
         "artifact_role": "offline_classical_sa_quality_reference",
+        "hardware_energy_convention": ENERGY_CONVENTION,
         "protocol_version": protocol["protocol_version"],
         "protocol_sha256": sha256_file(protocol["_path"]),
         "sampling_configuration": {"backend": "sa", "matrix_space": "hardware-quantized",
@@ -403,6 +415,8 @@ def audit_exported_matrices(manifests, output_path, protocol_sha256=None):
                 h = np.asarray(problem["h"], dtype=np.float64)
                 j = np.asarray(problem["J"], dtype=np.float64)
                 q = np.asarray(problem["hardware_matrix"], dtype=np.int8)
+                convention = str(np.asarray(problem.get(
+                    "hardware_energy_convention", np.asarray(""))).reshape(-1)[0])
                 source_hash = str(np.asarray(problem.get(
                     "protocol_sha256", np.asarray(""))).reshape(-1)[0])
             if protocol_sha256 is not None and source_hash != protocol_sha256:
@@ -410,13 +424,23 @@ def audit_exported_matrices(manifests, output_path, protocol_sha256=None):
             rng = np.random.default_rng(2026 + int(item["index"]))
             spins = rng.choice(np.asarray([-1.0, 1.0]), size=(8, 48))
             augmented = np.concatenate((spins, np.ones((8, 1))), axis=1)
+            if convention != ENERGY_CONVENTION:
+                raise ValueError("Exported matrix uses a missing/stale SDK energy convention for %s" % item["id"])
             source = hardware_matrix_from_ising(h, j)
-            energy_error = float(np.max(np.abs(
-                np.einsum("bi,ij,bj->b", augmented, source, augmented)
-                - ising_energy(spins, h, j)
+            model_matrix = model_energy_matrix_from_ising(h, j)
+            model_energy = ising_energy(spins, h, j)
+            sdk_energy = -np.einsum("bi,ij,bj->b", augmented, source, augmented)
+            energy_error = float(np.max(np.abs(sdk_energy - model_energy)))
+            model_map_error = float(np.max(np.abs(
+                np.einsum("bi,ij,bj->b", augmented, model_matrix, augmented) - model_energy
             )))
             if energy_error > 1e-10:
-                raise ValueError("Auxiliary-spin energy mapping failed for %s" % item["id"])
+                raise ValueError("Kaiwu SDK energy mapping failed for %s" % item["id"])
+            gain = float(item["hardware_gain"])
+            quantized_sdk_energy = -np.einsum(
+                "bi,ij,bj->b", augmented, q.astype(np.float64), augmented
+            ) / gain
+            quantized_energy_error = float(np.max(np.abs(quantized_sdk_energy - model_energy)))
             if q.shape != (49, 49) or not np.array_equal(q, q.T) or np.any(np.diag(q)):
                 raise ValueError("Invalid 49-spin matrix for %s" % item["id"])
             audit = item.get("quantization_audit") or {}
@@ -425,10 +449,14 @@ def audit_exported_matrices(manifests, output_path, protocol_sha256=None):
                 "gain": item.get("hardware_gain"),
                 "logical_n_bits": int(h.size),
                 "hardware_n_bits": int(q.shape[0]),
-                "source_nonzero_coefficients": audit.get("source_nonzero_coefficients"),
+            "source_nonzero_coefficients": audit.get("source_nonzero_coefficients"),
                 "nonzero_edges": audit.get("nonzero_edges"),
                 "max_abs_integer": audit.get("max_abs_integer"),
                 "relative_quantization_error": audit.get("relative_quantization_error"),
+                "energy_convention": convention,
+                "model_matrix_mapping_max_abs_error": model_map_error,
+                "sdk_float_matrix_mapping_max_abs_error": energy_error,
+                "sdk_quantized_energy_div_gain_max_abs_error": quantized_energy_error,
                 "zeroed_coefficient_fraction": audit.get("nonzero_quantized_to_zero_fraction"),
                 "clipping": audit.get("clipping"),
                 "matrix_sha256": matrix_sha256(q),
@@ -492,6 +520,8 @@ def prepare(protocol_path=DEFAULT_PROTOCOL, output_dir=DEFAULT_OUTPUT):
     protocol_path = Path(protocol_path).resolve()
     output_dir = Path(output_dir).resolve()
     protocol = load_protocol(protocol_path)
+    if protocol.get("hardware", {}).get("energy_convention") != ENERGY_CONVENTION:
+        raise ValueError("OPSD preparation requires an explicit corrected-energy protocol version")
     protocol["_path"] = str(protocol_path)
     output_dir.mkdir(parents=True, exist_ok=True)
     if any(output_dir.iterdir()):
@@ -572,6 +602,7 @@ def prepare(protocol_path=DEFAULT_PROTOCOL, output_dir=DEFAULT_OUTPUT):
     prep_manifest = {
         "artifact_role": "offline_hardware_preparation",
         "protocol_version": protocol["protocol_version"],
+        "hardware_energy_convention": ENERGY_CONVENTION,
         "eligible_for_paper": False,
         "hardware_claim": False,
         "physical_platform_used": False,

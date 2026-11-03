@@ -17,6 +17,7 @@ from GEFcom2014.models.QBM_VAE.forecast_anchor import (
     predict_deterministic_anchor,
 )
 from GEFcom2014.models.QBM_VAE.kaiwu_adapter import (
+    ENERGY_CONVENTION,
     HARDWARE_N_BITS,
     LOGICAL_N_BITS,
     build_task_name,
@@ -182,10 +183,14 @@ def main():
             "beta": np.asarray(args.beta),
             "trotter_replicas": np.asarray(replicas),
             "representation": np.asarray(representation),
+            "model_energy_convention": np.asarray(
+                "E(s) = -h^T s - 0.5 s^T J s"
+            ),
         }
         if hardware_problem is not None:
             problem_arrays.update(
                 {
+                    "hardware_energy_convention": np.asarray(ENERGY_CONVENTION),
                     "hardware_matrix": hardware_problem["matrix"],
                     "hardware_source_matrix": hardware_problem["source_matrix"],
                     "hardware_gain": np.asarray(hardware_problem["hardware_gain"]),
@@ -207,6 +212,7 @@ def main():
             np.savez_compressed(
                 hardware_matrix_path,
                 hardware_matrix=hardware_problem["matrix"],
+                hardware_energy_convention=np.asarray(ENERGY_CONVENTION),
                 hardware_gain=np.asarray(hardware_problem["hardware_gain"]),
                 logical_n_bits=np.asarray(LOGICAL_N_BITS),
                 hardware_n_bits=np.asarray(HARDWARE_N_BITS),
@@ -276,6 +282,9 @@ def main():
                 hardware_problem["audit"]["matrix_sha256"]
                 if hardware_problem is not None
                 else None
+            ),
+            "hardware_energy_convention": (
+                ENERGY_CONVENTION if hardware_problem is not None else None
             ),
             "quantization_audit": (
                 hardware_problem["audit"] if hardware_problem is not None else None
@@ -532,13 +541,11 @@ def build_platform_payload(instance_id, h, j, representation="classical_ising",
                 "hardware_matrix": hardware_matrix.tolist(),
                 "hardware_gain": float(hardware_problem["hardware_gain"]),
                 "hardware_matrix_sha256": audit["matrix_sha256"],
-                "hardware_energy_convention": (
-                    "u^T Q u = hardware_gain * E(s), u=[s,+1]"
-                ),
+                "hardware_energy_convention": ENERGY_CONVENTION,
                 "hardware_matrix_dtype": "int8",
                 "quantization_audit": audit,
                 "source_energy_convention": "E(s) = -h^T s - 0.5 s^T J s",
-                "quantization_rule": "Q = round-half-to-even(hardware_gain * M)",
+                "quantization_rule": "K_int8 = round-half-to-even(hardware_gain * K_float)",
                 "hardware_sampling_reads": {
                     "minimum": 10,
                     "maximum": 2000,

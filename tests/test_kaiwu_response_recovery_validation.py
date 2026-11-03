@@ -24,8 +24,8 @@ from GEFcom2014.models.QBM_VAE.kaiwu_13k_protocol import load_protocol
 
 
 ROOT = Path(__file__).resolve().parents[1]
-PROTOCOL_PATH = ROOT / "configs/paper/fa_bm_vae_opsd_sa_negative_kaiwu_protocol.json"
-PREPARATION = ROOT / "export/opsd_sa_negative_kaiwu_preparation_v8"
+PROTOCOL_PATH = ROOT / "configs/paper/fa_bm_vae_opsd_sa_negative_kaiwu_protocol_v9.json"
+PREPARATION = ROOT / "export/opsd_sa_negative_kaiwu_preparation_v9"
 _CHECKPOINT_TEMP_DIRS = []
 
 
@@ -154,9 +154,11 @@ def _platform_receipt_for_waiting_response(tmp_path, tasks, task_name):
     evidence_dir = tmp_path / ("synthetic_platform_gain_%d" % task["gain"]) / instance_id
     evidence_dir.mkdir(parents=True, exist_ok=True)
     platform_record = evidence_dir / "synthetic_platform_record.json"
+    with np.load(response, allow_pickle=False) as archive:
+        sdk_name = str(archive["platform_task_name"].item()) if "platform_task_name" in archive else task["task_name"]
     platform_record.write_text(json.dumps({
         "job_id": "synthetic-platform-job-" + instance_id,
-        "task_name": task["task_name"], "matrix_sha256": task["matrix_sha256"],
+        "task_name": sdk_name, "matrix_sha256": task["matrix_sha256"],
         "status": "completed", "requested_reads": 100, "returned_reads": 100,
         "submitted_at": "2026-01-01T00:00:05Z",
         "completed_at": "2026-01-01T00:01:05Z",
@@ -392,9 +394,11 @@ def test_actual_submit_audit_survives_receipt_pause_and_interruption(tmp_path, m
                 __version__="synthetic",
                 common=SimpleNamespace(CheckpointManager=SimpleNamespace(save_dir="")))
 
-        def sample_hardware_matrix(self, matrix, num_reads, task_name):
+        def sample_hardware_matrix(self, matrix, num_reads, task_name, energy_convention=None):
+            from GEFcom2014.models.QBM_VAE.kaiwu_adapter import platform_task_name
             return {"samples": np.ones((num_reads, matrix.shape[0]), dtype=np.int8),
-                    "metadata": {"task_name": task_name, "backend": "kaiwu_cim_sampling"}}
+                    "metadata": {"task_name": task_name, "backend": "kaiwu_cim_sampling",
+                                 "platform_task_name": platform_task_name(task_name)}}
 
     monkeypatch.setattr(submission, "KaiwuClient", OfflineClient)
 

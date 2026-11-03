@@ -51,6 +51,17 @@ def test_vs_execution_order_is_date_interleaved_and_bound_to_frozen_inputs(tmp_p
         validate_vs_execution_order(order_path, tasks, "a" * 64, "b" * 64)
 
 
+def test_v8_wrong_sign_matrix_is_refused_by_real_execution_preflight():
+    protocol = load_protocol("configs/paper/fa_bm_vae_opsd_sa_negative_kaiwu_protocol.json")
+    protocol["_path"] = "configs/paper/fa_bm_vae_opsd_sa_negative_kaiwu_protocol.json"
+    tasks = __import__("GEFcom2014.models.QBM_VAE.run_kaiwu_13k_sampling",
+                       fromlist=["_vs_tasks"])._vs_tasks(
+                           __import__("pathlib").Path("export/opsd_sa_negative_kaiwu_preparation_v8"),
+                           protocol)
+    with pytest.raises(RuntimeError, match="corrected task energy convention"):
+        _validate_execution_limits(tasks)
+
+
 def test_opsd_v5_stale_task_names_are_rejected_instead_of_rewritten():
     from GEFcom2014.models.QBM_VAE.run_kaiwu_13k_sampling import _vs_tasks
     protocol = load_protocol("configs/paper/fa_bm_vae_opsd_sa_negative_kaiwu_protocol.json")
@@ -105,7 +116,9 @@ def test_submission_scope_rejects_before_any_submit(tmp_path, monkeypatch, mode,
               "matrix_sha256": "h%d" % i, "reads": 100,
               "matrix": tmp_path / "matrix.npz"} for i in range(2)]
     monkeypatch.setattr(driver, "load_protocol", lambda _: {
-        "protocol_version": "test-only", "gain_selection": {"quality_gate": policy}})
+        "protocol_version": "test-only",
+        "hardware": {"energy_convention": driver.ENERGY_CONVENTION},
+        "gain_selection": {"quality_gate": policy}})
     monkeypatch.setattr(driver, "planned_tasks", lambda *a: tasks)
     monkeypatch.setattr(driver, "_validate_execution_limits", lambda _: None)
     calls = []
@@ -159,7 +172,8 @@ def test_spqc550_without_project_no_reaches_mocked_submit(tmp_path, monkeypatch)
     monkeypatch.delenv("FA_BM_VAE_RUN_REAL_KAIWU", raising=False)
     monkeypatch.setattr(
         "GEFcom2014.models.QBM_VAE.run_kaiwu_13k_sampling.load_protocol",
-        lambda _: {"protocol_version": "test-protocol"},
+        lambda _: {"protocol_version": "test-protocol",
+                   "hardware": {"energy_convention": "kaiwu_sdk_hamiltonian_matches_fa_bm_vae_energy_v1"}},
     )
     monkeypatch.setattr(
         "GEFcom2014.models.QBM_VAE.run_kaiwu_13k_sampling.planned_tasks",
@@ -210,7 +224,9 @@ def test_batch_stops_on_invalid_response_without_retry(tmp_path, monkeypatch, st
               "matrix": tmp_path / ("matrix%d.npz" % i)} for i in range(3)]
     quality_policy = _approved_quality_policy()
     monkeypatch.setattr(driver, "load_protocol", lambda _: {
-        "protocol_version": "test-only", "gain_selection": {"quality_gate": quality_policy}})
+        "protocol_version": "test-only",
+        "hardware": {"energy_convention": driver.ENERGY_CONVENTION},
+        "gain_selection": {"quality_gate": quality_policy}})
     monkeypatch.setattr(driver, "planned_tasks", lambda *args: tasks)
     monkeypatch.setattr(driver, "_validate_execution_limits", lambda _: None)
     monkeypatch.setattr(driver, "official_task_query_capability", lambda: None)
@@ -325,8 +341,10 @@ def test_pending_intent_filename_and_task_identity_are_validated(tmp_path):
 
 
 def test_real_execution_checks_spqc550_profile(tmp_path):
+    from GEFcom2014.models.QBM_VAE.kaiwu_adapter import ENERGY_CONVENTION
     manifest = tmp_path / "submission_manifest.json"
     manifest.write_text(json.dumps({
+        "hardware_energy_convention": ENERGY_CONVENTION,
         "platform_limits_checked": {
             "int8_coefficient_range": [-128, 127],
             "int8_range_verified": True,
@@ -334,12 +352,15 @@ def test_real_execution_checks_spqc550_profile(tmp_path):
                                 "full_connectivity": True, "coupling_precision": "int8"},
         }
     }), encoding="utf-8")
-    _validate_execution_limits([{"manifest": manifest}])
+    from GEFcom2014.models.QBM_VAE.kaiwu_adapter import ENERGY_CONVENTION
+    _validate_execution_limits([{"manifest": manifest,
+                                 "hardware_energy_convention": ENERGY_CONVENTION}])
     payload = json.loads(manifest.read_text(encoding="utf-8"))
     payload["platform_limits_checked"]["machine_profile"]["name"] = "CPQC-550"
     manifest.write_text(json.dumps(payload), encoding="utf-8")
     with pytest.raises(RuntimeError, match="SPQC-550"):
-        _validate_execution_limits([{"manifest": manifest}])
+        _validate_execution_limits([{"manifest": manifest,
+                                     "hardware_energy_convention": ENERGY_CONVENTION}])
 
 
 def test_resume_recognizes_completed_matrix_without_repeating_charge(tmp_path):
@@ -363,6 +384,176 @@ def test_test_stage_requires_verified_frozen_gain(tmp_path):
     }), encoding="utf-8")
     with pytest.raises(RuntimeError, match="verified physical"):
         planned_tasks("test", tmp_path, tmp_path)
+
+
+def _frozen_test_planning_fixture(tmp_path, monkeypatch):
+    import hashlib
+    import numpy as np
+    from pathlib import Path
+    from GEFcom2014.models.QBM_VAE import run_kaiwu_13k_sampling as driver
+    from GEFcom2014.models.QBM_VAE.kaiwu_adapter import ENERGY_CONVENTION
+    from GEFcom2014.models.QBM_VAE.kaiwu_13k_protocol import select_vs_gain
+    from tests.test_kaiwu_13k_protocol import _approved_quality_policy, _complete_vs_records
+
+    protocol_path = tmp_path / "protocol.json"
+    protocol = {
+        "protocol_version": "fixture-test-energy-v1",
+        "_path": str(protocol_path),
+        "hardware": {"candidate_gains": [125, 150, 200],
+                     "reads_per_instance": 100,
+                     "energy_convention": ENERGY_CONVENTION},
+        "vs": {"instances": 2},
+        "test": {"instances": 1},
+        "gain_selection": {"quality_gate": _approved_quality_policy()},
+    }
+    protocol_path.write_text(json.dumps({key: value for key, value in protocol.items()
+                                        if key != "_path"}), encoding="utf-8")
+    protocol_hash = hashlib.sha256(protocol_path.read_bytes()).hexdigest()
+    preparation = tmp_path / "preparation"
+    (preparation / "test_logical").mkdir(parents=True)
+    (preparation / "preparation_manifest.json").write_text(json.dumps({
+        "protocol_version": protocol["protocol_version"],
+        "protocol_sha256": protocol_hash,
+        "model_checkpoint_sha256": "fixture-model-sha256",
+        "manifest_hashes": {},
+    }), encoding="utf-8")
+    prep_manifest_path = preparation / "preparation_manifest.json"
+    prep_hash = hashlib.sha256(prep_manifest_path.read_bytes()).hexdigest()
+    identity = {"protocol_sha256": protocol_hash,
+                "model_checkpoint_sha256": "fixture-model-sha256",
+                "preparation_manifest_sha256": prep_hash}
+
+    vs_records_dir = tmp_path / "vs-records"
+    vs_records_dir.mkdir()
+    records = _complete_vs_records(vs_records_dir)
+    tasks = []
+    for index, record in enumerate(records):
+        response_path = Path(record["response_path"])
+        np.savez_compressed(
+            response_path, samples=np.ones((100, 49), dtype=np.int8),
+            instance_id=record["instance_id"], task_id=record["task_id"],
+            task_name=record["task_name"], matrix_sha256=record["matrix_sha256"],
+            stage="vs", hardware_gain=record["gain"], requested_reads=100,
+            returned_reads=100, hardware_energy_convention=ENERGY_CONVENTION,
+        )
+        record.update(identity)
+        record.update({"protocol_version": protocol["protocol_version"],
+                       "hardware_energy_convention": ENERGY_CONVENTION,
+                       "requested_reads": 100, "returned_reads": 100,
+                       "response_file_sha256": hashlib.sha256(response_path.read_bytes()).hexdigest()})
+        tasks.append({"protocol_version": protocol["protocol_version"],
+                      "stage": "vs", "instance_id": record["instance_id"],
+                      "gain": record["gain"], "matrix_sha256": record["matrix_sha256"],
+                      "requested_reads": 100, "reads": 100,
+                      "task_name": record["task_name"],
+                      "hardware_energy_convention": ENERGY_CONVENTION, **identity})
+    source_payload = preparation / "test_logical" / "test_000.json"
+    source_payload.write_text(json.dumps({
+        "instance_id": "test_000", "split": "TEST",
+        "protocol_version": protocol["protocol_version"],
+        "protocol_sha256": protocol_hash,
+        "hardware_energy_convention": None,
+        "h": [0.0] * 48,
+        "couplings": [{"i": 0, "j": 1, "value": 0.1}],
+    }), encoding="utf-8")
+    source_manifest = preparation / "test_logical" / "fixture_test_manifest.json"
+    source_manifest.write_text(json.dumps([{
+        "id": "test_000", "split": "TEST", "protocol_sha256": protocol_hash,
+        "platform_payload": str(source_payload.resolve()),
+    }]), encoding="utf-8")
+    preparation_payload = json.loads(prep_manifest_path.read_text(encoding="utf-8"))
+    preparation_payload["manifest_hashes"]["test_logical_manifest"] = hashlib.sha256(
+        source_manifest.read_bytes()).hexdigest()
+    prep_manifest_path.write_text(json.dumps(preparation_payload), encoding="utf-8")
+    # The test fixture's preparation hash is now final; the simulated physical
+    # VS gain freeze is created only after all source identities are fixed.
+    prep_hash = hashlib.sha256(prep_manifest_path.read_bytes()).hexdigest()
+    identity["preparation_manifest_sha256"] = prep_hash
+    for record in records:
+        record["preparation_manifest_sha256"] = prep_hash
+    for task in tasks:
+        task["preparation_manifest_sha256"] = prep_hash
+    task_map = {(float(task["gain"]), task["instance_id"]):
+                driver._task_expected(task) for task in tasks}
+    select_vs_gain(
+        records, preparation / "real_gain_selection.json",
+        required_gains=(125, 150, 200), expected_instances_per_gain=2,
+        expected_instance_ids=("vs_0", "vs_1"), expected_task_map=task_map,
+        expected_identity=identity,
+        quality_policy=protocol["gain_selection"]["quality_gate"],
+        recompute_from_raw=False,
+    )
+    monkeypatch.setattr(driver, "_vs_tasks", lambda preparation, protocol: tasks)
+    monkeypatch.setattr(driver, "load_protocol", lambda path: dict(protocol))
+    return protocol, preparation
+
+
+def test_test_manifest_energy_convention_flows_from_vs_freeze_to_submit_mock(tmp_path, monkeypatch):
+    import numpy as np
+    from pathlib import Path
+    from GEFcom2014.models.QBM_VAE import submit_kaiwu_sampling as submission
+    from GEFcom2014.models.QBM_VAE.kaiwu_adapter import ENERGY_CONVENTION, platform_task_name
+    protocol, preparation = _frozen_test_planning_fixture(tmp_path, monkeypatch)
+    tasks = planned_tasks("test", preparation, tmp_path / "responses", protocol)
+    assert len(tasks) == 1
+    task = tasks[0]
+    assert task["hardware_energy_convention"] == ENERGY_CONVENTION
+    manifest = json.loads(Path(task["manifest"]).read_text(encoding="utf-8"))
+    assert manifest["hardware_energy_convention"] == ENERGY_CONVENTION
+    assert manifest["instances"][0]["hardware_energy_convention"] == ENERGY_CONVENTION
+    calls = []
+
+    class FakeCheckpointManager:
+        save_dir = None
+
+    class FakeClient:
+        def __init__(self, **kwargs):
+            self._kaiwu = SimpleNamespace(__version__="offline-test",
+                common=SimpleNamespace(CheckpointManager=FakeCheckpointManager))
+
+        def sample_hardware_matrix(self, matrix, num_reads, task_name, energy_convention=None):
+            calls.append((num_reads, task_name, energy_convention))
+            return {"samples": np.ones((num_reads, matrix.shape[0]), dtype=np.int8),
+                    "metadata": {"task_name": task_name,
+                                 "platform_task_name": platform_task_name(task_name),
+                                 "backend": "kaiwu-offline-test"}}
+
+    monkeypatch.setattr(submission, "KaiwuClient", FakeClient)
+    result = submission.submit_one(
+        task["matrix"], task["instance_id"], tmp_path / "responses", task["reads"],
+        checkpoint_dir=tmp_path / "checkpoints", task_name=task["task_name"],
+        stage="test", hardware_gain=task["gain"], frozen_task=task,
+    )
+    assert result[0].is_file()
+    assert calls == [(100, task["task_name"], ENERGY_CONVENTION)]
+
+
+@pytest.mark.parametrize("tamper", ["wrong_convention", "missing_convention", "payload_hash"])
+def test_test_manifest_tampering_fails_before_intent_or_submit(tmp_path, monkeypatch, tamper):
+    from GEFcom2014.models.QBM_VAE import run_kaiwu_13k_sampling as driver
+    from pathlib import Path
+    protocol, preparation = _frozen_test_planning_fixture(tmp_path, monkeypatch)
+    tasks = planned_tasks("test", preparation, tmp_path / "responses", protocol)
+    manifest_path = Path(tasks[0]["manifest"])
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    if tamper == "wrong_convention":
+        manifest["hardware_energy_convention"] = "old_wrong_sign"
+    elif tamper == "missing_convention":
+        manifest.pop("hardware_energy_convention")
+    else:
+        manifest["instances"][0]["payload_sha256"] = "0" * 64
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+    submit_calls = []
+    monkeypatch.setattr(driver, "submit_one", lambda *args, **kwargs: submit_calls.append(args))
+    output_dir = tmp_path / "real_responses"
+    checkpoint_dir = tmp_path / "checkpoints"
+    args = SimpleNamespace(stage="test", execute=True, output_dir=output_dir,
+        checkpoint_dir=checkpoint_dir, protocol=tmp_path / "protocol.json",
+        preparation=preparation, resume=True)
+    with pytest.raises(RuntimeError, match="manifest|energy convention|frozen artifacts"):
+        driver.run(args)
+    assert submit_calls == []
+    assert not checkpoint_dir.exists() or not list(checkpoint_dir.glob("*.intent.json"))
 
 
 def test_limit_is_applied_after_completed_filter():

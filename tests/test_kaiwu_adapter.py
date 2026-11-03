@@ -10,11 +10,14 @@ from GEFcom2014.models.QBM_VAE.import_hardware_responses import (
 )
 from GEFcom2014.models.QBM_VAE.kaiwu_adapter import (
     KaiwuClient,
+    ENERGY_CONVENTION,
     binary_to_spin,
     hardware_matrix_from_ising,
+    model_energy_matrix_from_ising,
     kaiwu_sdk_versions,
     matrix_sha256,
     normalize_hardware_spins,
+    platform_task_name,
     quantize_hardware_matrix,
     spin_to_binary,
     validate_raw_hardware_spins,
@@ -30,7 +33,8 @@ def _strict_submission_fixture(tmp_path, identity):
     j = np.zeros((48, 48))
     quantized = quantize_hardware_matrix(h, j, hardware_gain=20.0)
     matrix_path = tmp_path / "matrix.npz"
-    np.savez_compressed(matrix_path, hardware_matrix=quantized["matrix"])
+    np.savez_compressed(matrix_path, hardware_matrix=quantized["matrix"],
+                        hardware_energy_convention=ENERGY_CONVENTION)
     payload = build_platform_payload("strict_000", h, j, hardware_problem=quantized)
     protocol_sha = "a" * 64
     payload.update({
@@ -76,22 +80,39 @@ def test_task_name_is_deterministic_for_retries():
     assert "125" in first and "a" * 12 in first
 
 
+def test_platform_name_preserves_full_identity_without_truncation_collisions():
+    from GEFcom2014.models.QBM_VAE.kaiwu_adapter import build_task_name
+    first = build_task_name("opsd-wind_" * 12, "a" * 64, gain=125)
+    second = build_task_name("opsd-wind_" * 12, "b" * 64, gain=125)
+    assert first[:100] == second[:100]
+    assert platform_task_name(first) != platform_task_name(second)
+    assert platform_task_name(first) == platform_task_name(first)
+    assert len(platform_task_name(first).encode("ascii")) == 32
+    assert len(platform_task_name("测试" * 30).encode("ascii")) == 32
+    assert platform_task_name("existing-short-name") == "existing-short-name"
+
+
 def test_current_sdk_has_no_task_name_query_capability():
     from GEFcom2014.models.QBM_VAE.kaiwu_adapter import load_kaiwu_sdk, official_task_query_capability
     _, optimizer_cls, _ = load_kaiwu_sdk()
     assert official_task_query_capability(optimizer_cls) is None
 
 
-def test_auxiliary_matrix_matches_original_energy_by_enumeration():
+def test_sdk_matrix_and_model_energy_matrix_match_original_energy_by_enumeration():
     h = np.array([0.7, -0.2, 0.4])
     j = np.array([[0.0, 0.3, -0.1], [0.3, 0.0, 0.25], [-0.1, 0.25, 0.0]])
     matrix = hardware_matrix_from_ising(h, j, logical_n_bits=3)
+    model_matrix = model_energy_matrix_from_ising(h, j, logical_n_bits=3)
     states = np.asarray(
         [[-1 if (index >> bit) & 1 else 1 for bit in range(3)] for index in range(8)]
     )
     original = -states @ h - 0.5 * np.einsum("bi,ij,bj->b", states, j, states)
     augmented = np.concatenate((states, np.ones((states.shape[0], 1))), axis=1)
-    np.testing.assert_allclose(np.einsum("bi,ij,bj->b", augmented, matrix, augmented), original)
+    np.testing.assert_allclose(np.einsum("bi,ij,bj->b", augmented, model_matrix, augmented), original)
+    np.testing.assert_allclose(-np.einsum("bi,ij,bj->b", augmented, matrix, augmented), original)
+    np.testing.assert_array_equal(matrix, -model_matrix)
+    flipped = -augmented
+    np.testing.assert_allclose(-np.einsum("bi,ij,bj->b", flipped, matrix, flipped), original)
 
 
 def test_one_spin_sign_probe_is_exact():
@@ -99,8 +120,53 @@ def test_one_spin_sign_probe_is_exact():
     j = np.zeros((1, 1))
     matrix = hardware_matrix_from_ising(h, j, logical_n_bits=1)
     augmented = np.array([[1.0, 1.0], [-1.0, 1.0]])
-    energy = np.einsum("bi,ij,bj->b", augmented, matrix, augmented)
+    energy = -np.einsum("bi,ij,bj->b", augmented, matrix, augmented)
     np.testing.assert_allclose(energy, np.array([-1.0, 1.0]))
+
+
+def test_installed_kaiwu_hamiltonian_matches_model_energy_exhaustively():
+    from kaiwu.common import hamiltonian
+
+    h = np.array([0.7, -0.2, 0.4], dtype=np.float64)
+    j = np.array([[0.0, 0.3, -0.1], [0.3, 0.0, 0.25], [-0.1, 0.25, 0.0]], dtype=np.float64)
+    K = hardware_matrix_from_ising(h, j, logical_n_bits=3).astype(np.float64)
+    states = np.array([[(-1.0 if (i >> b) & 1 else 1.0) for b in range(3)] for i in range(8)])
+    model_energy = -states @ h - 0.5 * np.einsum("bi,ij,bj->b", states, j, states)
+    for auxiliary in (-1.0, 1.0):
+        raw = np.column_stack((states * auxiliary, np.full(len(states), auxiliary)))
+        actual_sdk = np.asarray(hamiltonian(K, raw), dtype=np.float64)
+        np.testing.assert_allclose(actual_sdk, model_energy, rtol=0, atol=1e-12)
+
+
+def test_quantized_sdk_energy_error_matches_float64_quantization_error():
+    from kaiwu.common import hamiltonian
+
+    h = np.array([0.13, -0.21], dtype=np.float64)
+    j = np.array([[0.0, -0.17], [-0.17, 0.0]], dtype=np.float64)
+    gain = 20.0
+    result = quantize_hardware_matrix(h, j, gain, logical_n_bits=2)
+    states = np.array([[1., 1.], [1., -1.], [-1., 1.], [-1., -1.]])
+    logical_energy = -states @ h - 0.5 * np.einsum("bi,ij,bj->b", states, j, states)
+    model_K = hardware_matrix_from_ising(h, j, 2)
+    float_sdk = np.asarray(hamiltonian(model_K, np.column_stack((states, np.ones(4)))), dtype=np.float64)
+    q64 = result["matrix"].astype(np.float64)
+    quant_sdk = np.asarray(hamiltonian(q64, np.column_stack((states, np.ones(4)))), dtype=np.float64)
+    np.testing.assert_allclose(float_sdk, logical_energy, atol=1e-12, rtol=0)
+    error = np.abs(quant_sdk / gain - logical_energy)
+    assert np.max(error) > 0
+    assert np.isclose(np.linalg.norm((q64 / gain) - model_K) / np.linalg.norm(model_K),
+                      result["audit"]["relative_quantization_error"])
+
+
+def test_int8_negative_boundary_is_audited_and_energy_is_widened():
+    from kaiwu.common import hamiltonian
+
+    result = quantize_hardware_matrix(np.array([-2.048]), np.zeros((1, 1)), 125.0, 1)
+    assert result["matrix"][0, 1] == -128
+    assert result["audit"]["max_abs_integer"] == 128
+    raw = np.array([[1, 1]], dtype=np.int64)
+    energy = hamiltonian(result["matrix"].astype(np.int64), raw)
+    assert int(energy[0]) == 256
 
 
 def test_global_gain_quantization_is_audited_and_reproducible():
@@ -125,7 +191,8 @@ def test_quantization_rejects_overflow_instead_of_clipping():
 
 
 @pytest.mark.parametrize("project_no", [None, "runtime-only-project"])
-def test_kaiwu_client_uses_sampling_mode_without_importing_the_sdk(monkeypatch, project_no):
+@pytest.mark.parametrize("task_name", ["unique-test-task", "frozen_opsd_task_" * 10])
+def test_kaiwu_client_uses_sampling_mode_without_importing_the_sdk(monkeypatch, project_no, task_name):
     calls = {}
 
     class FakeTaskMode:
@@ -133,6 +200,7 @@ def test_kaiwu_client_uses_sampling_mode_without_importing_the_sdk(monkeypatch, 
 
     class FakeOptimizer:
         def __init__(self, **kwargs):
+            assert len(kwargs["task_name"].encode("ascii")) <= 32
             calls.update(kwargs)
 
         def solve(self, matrix, negtail_flip=True, sort_solutions=True):
@@ -149,15 +217,145 @@ def test_kaiwu_client_uses_sampling_mode_without_importing_the_sdk(monkeypatch, 
     result = client.sample_hardware_matrix(
         np.zeros((49, 49), dtype=np.int8),
         num_reads=10,
-        task_name="unique-test-task",
+        task_name=task_name,
+        energy_convention=ENERGY_CONVENTION,
     )
     assert result["samples"].shape == (10, 49)
     assert calls["task_mode"] == "sampling"
     assert calls["sample_number"] == 10
-    assert calls["task_name"] == "unique-test-task"
+    assert calls["task_name"] == platform_task_name(task_name)
+    assert result["metadata"]["task_name"] == task_name
+    assert result["metadata"]["platform_task_name"] == calls["task_name"]
     assert calls["project_no"] == project_no
     assert calls["negtail_flip"] is False
     assert calls["sort_solutions"] is False
+
+
+def test_sample_ising_compatibility_maps_j_plus_2k_without_sign_flip(monkeypatch):
+    expected = np.zeros((49, 49), dtype=np.int8)
+    expected[0, 48] = expected[48, 0] = -3
+    seen = {}
+
+    class FakeTaskMode:
+        SAMPLING = "sampling"
+
+    class FakeOptimizer:
+        def __init__(self, **kwargs):
+            pass
+
+        def solve(self, matrix, **kwargs):
+            seen["matrix"] = matrix.copy()
+            return np.ones((10, 49), dtype=np.int8)
+
+    monkeypatch.setattr(
+        "GEFcom2014.models.QBM_VAE.kaiwu_adapter.load_kaiwu_sdk",
+        lambda: (SimpleNamespace(), FakeOptimizer, FakeTaskMode),
+    )
+    result = KaiwuClient().sample_ising(
+        h=np.zeros(49), j=2.0 * expected.astype(np.float64), num_reads=10,
+        energy_convention=ENERGY_CONVENTION,
+    )
+    np.testing.assert_array_equal(seen["matrix"], expected)
+    assert result["samples"].shape == (10, 49)
+
+
+def test_real_client_refuses_missing_energy_convention_before_sdk_load(monkeypatch):
+    def forbidden_sdk_load():
+        raise AssertionError("SDK must not be loaded for an unmarked energy convention")
+
+    monkeypatch.setattr(
+        "GEFcom2014.models.QBM_VAE.kaiwu_adapter.load_kaiwu_sdk",
+        forbidden_sdk_load,
+    )
+    client = KaiwuClient()
+    with pytest.raises(ValueError, match="corrected energy convention"):
+        client.sample_hardware_matrix(np.zeros((49, 49), dtype=np.int8), 10)
+
+
+@pytest.mark.parametrize("coefficient", [-129, 128, 32768, 65536])
+def test_sample_ising_rejects_out_of_range_before_sdk_load(monkeypatch, coefficient):
+    def forbidden_sdk_load():
+        raise AssertionError("SDK must not load for out-of-range integer couplings")
+
+    monkeypatch.setattr(
+        "GEFcom2014.models.QBM_VAE.kaiwu_adapter.load_kaiwu_sdk",
+        forbidden_sdk_load,
+    )
+    matrix_j = np.zeros((49, 49), dtype=np.float64)
+    matrix_j[0, 1] = matrix_j[1, 0] = 2.0 * coefficient
+    client = KaiwuClient()
+    with pytest.raises(ValueError, match=r"\[-128, 127\]"):
+        client.sample_ising(h=np.zeros(49), j=matrix_j,
+                            energy_convention=ENERGY_CONVENTION)
+
+
+@pytest.mark.parametrize("mutation", [
+    "nan", "positive_infinity", "negative_infinity", "fractional",
+    "asymmetric", "nonzero_diagonal", "wrong_shape", "nonzero_field",
+])
+def test_sample_ising_rejects_malformed_matrix_before_sdk_load(monkeypatch, mutation):
+    def forbidden_sdk_load():
+        raise AssertionError("SDK must not load for malformed integer couplings")
+
+    monkeypatch.setattr(
+        "GEFcom2014.models.QBM_VAE.kaiwu_adapter.load_kaiwu_sdk",
+        forbidden_sdk_load,
+    )
+    matrix_j = np.zeros((49, 49), dtype=np.float64)
+    expected = ValueError
+    if mutation == "nan":
+        matrix_j[0, 1] = matrix_j[1, 0] = np.nan
+    elif mutation == "positive_infinity":
+        matrix_j[0, 1] = matrix_j[1, 0] = np.inf
+    elif mutation == "negative_infinity":
+        matrix_j[0, 1] = matrix_j[1, 0] = -np.inf
+    elif mutation == "fractional":
+        matrix_j[0, 1] = matrix_j[1, 0] = 0.5
+    elif mutation == "asymmetric":
+        matrix_j[0, 1] = 2.0
+    elif mutation == "nonzero_diagonal":
+        matrix_j[0, 0] = 2.0
+    elif mutation == "nonzero_field":
+        pass
+    elif mutation == "wrong_shape":
+        matrix_j = np.zeros((48, 48), dtype=np.float64)
+        expected = ValueError
+    client = KaiwuClient()
+    field = np.zeros(49)
+    if mutation == "nonzero_field":
+        field[0] = 1e-12
+    with pytest.raises(expected):
+        client.sample_ising(h=field, j=matrix_j,
+                            energy_convention=ENERGY_CONVENTION)
+
+
+def test_sample_ising_accepts_exact_int8_boundaries_after_wide_validation(monkeypatch):
+    expected = np.zeros((49, 49), dtype=np.int8)
+    expected[0, 1] = expected[1, 0] = -128
+    expected[1, 2] = expected[2, 1] = 127
+    seen = {}
+
+    class FakeTaskMode:
+        SAMPLING = "sampling"
+
+    class FakeOptimizer:
+        def __init__(self, **kwargs):
+            pass
+
+        def solve(self, matrix, **kwargs):
+            seen["matrix"] = matrix.copy()
+            return np.ones((10, 49), dtype=np.int8)
+
+    monkeypatch.setattr(
+        "GEFcom2014.models.QBM_VAE.kaiwu_adapter.load_kaiwu_sdk",
+        lambda: (SimpleNamespace(), FakeOptimizer, FakeTaskMode),
+    )
+    result = KaiwuClient().sample_ising(
+        h=np.zeros(49), j=2.0 * expected.astype(np.float64), num_reads=10,
+        energy_convention=ENERGY_CONVENTION,
+    )
+    np.testing.assert_array_equal(seen["matrix"], expected)
+    assert result["samples"].shape == (10, 49)
 
 
 def test_gauge_normalization_and_binary_mapping_are_exact():
@@ -208,7 +406,8 @@ def test_hardware_submission_and_import_keep_49_raw_and_48_logical(tmp_path):
     j = np.zeros((48, 48))
     quantized = quantize_hardware_matrix(h, j, hardware_gain=20.0)
     matrix_path = tmp_path / "matrix.npz"
-    np.savez_compressed(matrix_path, hardware_matrix=quantized["matrix"])
+    np.savez_compressed(matrix_path, hardware_matrix=quantized["matrix"],
+                        hardware_energy_convention=ENERGY_CONVENTION)
     payload = build_platform_payload(
         "example_000",
         h,
@@ -334,7 +533,8 @@ def test_legacy_manifest_keeps_missing_identity_fields_null(tmp_path):
     j = np.zeros((48, 48))
     quantized = quantize_hardware_matrix(h, j, hardware_gain=20.0)
     matrix_path = tmp_path / "matrix.npz"
-    np.savez_compressed(matrix_path, hardware_matrix=quantized["matrix"])
+    np.savez_compressed(matrix_path, hardware_matrix=quantized["matrix"],
+                        hardware_energy_convention=ENERGY_CONVENTION)
     payload = build_platform_payload("legacy_000", h, j, hardware_problem=quantized)
     payload["hardware_matrix_file"] = str(matrix_path)
     payload_path = tmp_path / "legacy_payload.json"
@@ -360,11 +560,14 @@ def test_protocol_hash_without_version_cannot_downgrade_to_legacy(tmp_path):
     assert not output.exists()
 
 
-def test_submit_one_uses_task_checkpoint_and_records_runtime_audit(tmp_path, monkeypatch):
+@pytest.mark.parametrize("task_name", ["unique-task-123", "frozen_opsd_task_" * 10])
+def test_submit_one_uses_task_checkpoint_and_records_runtime_audit(tmp_path, monkeypatch, task_name):
     matrix = np.zeros((49, 49), dtype=np.int8)
     matrix[0, 48] = matrix[48, 0] = -1
     matrix_path = tmp_path / "matrix.npz"
-    np.savez_compressed(matrix_path, hardware_matrix=matrix, matrix_sha256=matrix_sha256(matrix))
+    np.savez_compressed(matrix_path, hardware_matrix=matrix,
+                        hardware_energy_convention=ENERGY_CONVENTION,
+                        matrix_sha256=matrix_sha256(matrix))
 
     class FakeCheckpointManager:
         save_dir = None
@@ -376,13 +579,14 @@ def test_submit_one_uses_task_checkpoint_and_records_runtime_audit(tmp_path, mon
                 common=SimpleNamespace(CheckpointManager=FakeCheckpointManager),
             )
 
-        def sample_hardware_matrix(self, matrix, num_reads, task_name):
+        def sample_hardware_matrix(self, matrix, num_reads, task_name, energy_convention=None):
             return {
                 "samples": np.ones((num_reads, matrix.shape[0]), dtype=np.int8),
                 "metadata": {
                     "backend": "kaiwu_cim_sampling",
                     "task_id": "task-123",
                     "task_name": task_name,
+                    "platform_task_name": platform_task_name(task_name),
                 },
             }
 
@@ -397,19 +601,23 @@ def test_submit_one_uses_task_checkpoint_and_records_runtime_audit(tmp_path, mon
         10,
         project_no="runtime-only-project",
         checkpoint_dir=tmp_path / "checkpoints",
-        task_name="unique-task-123",
+        task_name=task_name,
     )
 
-    expected_checkpoint = tmp_path / "checkpoints" / "unique-task-123"
+    expected_checkpoint = tmp_path / "checkpoints" / platform_task_name(task_name)
     assert FakeCheckpointManager.save_dir == str(expected_checkpoint.resolve())
     assert audit["sdk_version"] == "test-sdk"
     assert audit["platform_backend"] == "kaiwu.cim.CIMOptimizer"
     assert audit["task_id"] == "task-123"
+    assert audit["task_name"] == task_name
+    assert audit["platform_task_name"] == platform_task_name(task_name)
     assert audit["matrix_sha256"] == matrix_sha256(matrix)
     assert audit["checkpoint_dir"] == str(expected_checkpoint.resolve())
     assert output_path.is_file() and audit_path.is_file()
     assert audit["hardware_claim"] is False
     with np.load(output_path) as raw:
+        assert raw["task_name"].item() == task_name
+        assert raw["platform_task_name"].item() == platform_task_name(task_name)
         assert bool(raw["hardware_claim"]) is False
         assert bool(raw["physical_platform_used"]) is False
 
@@ -418,7 +626,8 @@ def test_submit_one_saves_valid_response_pending_platform_identity(tmp_path, mon
     matrix = np.zeros((49, 49), dtype=np.int8)
     matrix[0, 48] = matrix[48, 0] = 1
     matrix_path = tmp_path / "matrix.npz"
-    np.savez_compressed(matrix_path, hardware_matrix=matrix)
+    np.savez_compressed(matrix_path, hardware_matrix=matrix,
+                        hardware_energy_convention=ENERGY_CONVENTION)
 
     class FakeCheckpointManager:
         save_dir = None
@@ -430,7 +639,7 @@ def test_submit_one_saves_valid_response_pending_platform_identity(tmp_path, mon
                 common=SimpleNamespace(CheckpointManager=FakeCheckpointManager),
             )
 
-        def sample_hardware_matrix(self, matrix, num_reads, task_name):
+        def sample_hardware_matrix(self, matrix, num_reads, task_name, energy_convention=None):
             return {
                 "samples": np.ones((num_reads, matrix.shape[0]), dtype=np.int8),
                 "metadata": {"backend": "kaiwu_cim_sampling", "task_name": task_name},
@@ -452,7 +661,8 @@ def test_submit_one_saves_valid_response_pending_platform_identity(tmp_path, mon
 
 def test_submit_one_preserves_invalid_raw_response_and_refuses_result(tmp_path, monkeypatch):
     matrix_path = tmp_path / "matrix.npz"
-    np.savez_compressed(matrix_path, hardware_matrix=np.zeros((49, 49), dtype=np.int8))
+    np.savez_compressed(matrix_path, hardware_matrix=np.zeros((49, 49), dtype=np.int8),
+                        hardware_energy_convention=ENERGY_CONVENTION)
 
     class FakeCheckpointManager:
         save_dir = None
@@ -461,7 +671,7 @@ def test_submit_one_preserves_invalid_raw_response_and_refuses_result(tmp_path, 
         def __init__(self, **kwargs):
             self._kaiwu = SimpleNamespace(common=SimpleNamespace(CheckpointManager=FakeCheckpointManager))
 
-        def sample_hardware_matrix(self, matrix, num_reads, task_name):
+        def sample_hardware_matrix(self, matrix, num_reads, task_name, energy_convention=None):
             return {"samples": np.full((num_reads, 49), 1.9), "metadata": {"task_name": task_name}}
 
     monkeypatch.setattr(
@@ -478,9 +688,28 @@ def test_submit_one_preserves_invalid_raw_response_and_refuses_result(tmp_path, 
     assert not (output / "bad-response.json").exists()
 
 
+@pytest.mark.parametrize("short_cache", [False, True])
+def test_submit_one_refuses_prior_cache_under_either_task_name(tmp_path, monkeypatch, short_cache):
+    matrix_path = tmp_path / "matrix.npz"
+    np.savez_compressed(matrix_path, hardware_matrix=np.zeros((49, 49), dtype=np.int8),
+                        hardware_energy_convention=ENERGY_CONVENTION)
+    task_name = "frozen_task_" * 5
+    cache = tmp_path / "checkpoints" / (platform_task_name(task_name) if short_cache else task_name)
+    cache.mkdir(parents=True)
+    (cache / "prior.json").write_text("{}", encoding="utf-8")
+    monkeypatch.setattr(
+        "GEFcom2014.models.QBM_VAE.submit_kaiwu_sampling.KaiwuClient",
+        lambda **kwargs: pytest.fail("SDK must not be constructed for a prior cache"),
+    )
+    with pytest.raises(RuntimeError, match="checkpoint directory is non-empty"):
+        submit_one(matrix_path, "cached", tmp_path / "responses", 10,
+                   checkpoint_dir=tmp_path / "checkpoints", task_name=task_name)
+
+
 def test_submit_one_existing_response_stops_before_client_creation(tmp_path, monkeypatch):
     matrix_path = tmp_path / "matrix.npz"
-    np.savez_compressed(matrix_path, hardware_matrix=np.zeros((49, 49), dtype=np.int8))
+    np.savez_compressed(matrix_path, hardware_matrix=np.zeros((49, 49), dtype=np.int8),
+                        hardware_energy_convention=ENERGY_CONVENTION)
     output = tmp_path / "responses"
     output.mkdir()
     (output / "already.npz").write_bytes(b"prior")
@@ -493,6 +722,19 @@ def test_submit_one_existing_response_stops_before_client_creation(tmp_path, mon
                    checkpoint_dir=tmp_path / "checkpoints", task_name="task-already")
 
 
+def test_submit_one_rejects_unversioned_old_sign_matrix_before_sdk(tmp_path, monkeypatch):
+    matrix_path = tmp_path / "old-v8-matrix.npz"
+    np.savez_compressed(matrix_path, hardware_matrix=np.zeros((49, 49), dtype=np.int8))
+    monkeypatch.setattr(
+        "GEFcom2014.models.QBM_VAE.submit_kaiwu_sampling.KaiwuClient",
+        lambda **kwargs: pytest.fail("old matrix must be rejected before SDK construction"),
+    )
+    with pytest.raises(ValueError, match="corrected SDK/model energy convention"):
+        submit_one(matrix_path, "old-v8", tmp_path / "responses", 10,
+                   checkpoint_dir=tmp_path / "checkpoints", task_name="old-v8-task")
+    assert not (tmp_path / "checkpoints").exists()
+
+
 def test_quantized_sa_uses_matrix_beta_and_records_beta_scales(tmp_path, monkeypatch):
     h = np.array([0.2, -0.1])
     j = np.array([[0.0, 0.3], [0.3, 0.0]])
@@ -503,6 +745,7 @@ def test_quantized_sa_uses_matrix_beta_and_records_beta_scales(tmp_path, monkeyp
         h=h,
         J=j,
         hardware_matrix=quantized["matrix"],
+        hardware_energy_convention=np.asarray(ENERGY_CONVENTION),
         hardware_gain=np.asarray(20.0),
         hardware_matrix_sha256=np.asarray(quantized["audit"]["matrix_sha256"]),
     )
@@ -512,6 +755,19 @@ def test_quantized_sa_uses_matrix_beta_and_records_beta_scales(tmp_path, monkeyp
         encoding="utf-8",
     )
     output_dir = tmp_path / "output"
+    seen = {}
+
+    class FakeSampler:
+        def sample_ising(self, h, j, **kwargs):
+            seen["h"] = np.asarray(h, dtype=np.float64)
+            seen["j"] = np.asarray(j, dtype=np.float64)
+            seen["kwargs"] = kwargs
+            return SimpleNamespace(
+                samples=np.ones((10, 3), dtype=np.int8),
+                metadata={"backend": "sa", "latency_s": 0.01},
+            )
+
+    monkeypatch.setattr(sample_exported_ising, "build_sampler", lambda *a, **k: FakeSampler())
     monkeypatch.setattr(
         sys,
         "argv",
@@ -535,6 +791,12 @@ def test_quantized_sa_uses_matrix_beta_and_records_beta_scales(tmp_path, monkeyp
     )
     sample_exported_ising.main()
 
+    np.testing.assert_array_equal(seen["j"], 2.0 * quantized["matrix"].astype(np.float64))
+    raw = np.array([[1., -1., 1.]])
+    sdk_energy = -np.einsum("bi,ij,bj->b", raw, quantized["matrix"].astype(np.float64), raw)
+    local_energy = -0.5 * np.einsum("bi,ij,bj->b", raw, seen["j"], raw)
+    np.testing.assert_allclose(local_energy, sdk_energy)
+
     with np.load(output_dir / "sa" / "example.npz", allow_pickle=False) as result:
         assert float(result["logical_beta"]) == 1.0
         assert float(result["matrix_beta"]) == 0.05
@@ -542,3 +804,4 @@ def test_quantized_sa_uses_matrix_beta_and_records_beta_scales(tmp_path, monkeyp
         assert float(result["hardware_gain"]) == 20.0
         assert bool(result["hardware_claim"]) is False
         assert bool(result["physical_platform_used"]) is False
+        assert str(result["energy_convention"].item()) == ENERGY_CONVENTION

@@ -18,10 +18,12 @@ from pathlib import Path
 import numpy as np
 
 from .kaiwu_adapter import (
+    ENERGY_CONVENTION,
     KaiwuClient,
     build_task_name,
     kaiwu_sdk_versions,
     matrix_sha256,
+    platform_task_name,
     validate_hardware_matrix,
     validate_raw_hardware_spins,
     validate_sampling_reads,
@@ -30,7 +32,7 @@ from .kaiwu_adapter import (
 
 FROZEN_TASK_AUDIT_FIELDS = (
     "protocol_sha256", "model_checkpoint_sha256", "preparation_manifest_sha256",
-    "protocol_version", "hardware_matrix_path", "hardware_matrix_file_sha256",
+    "protocol_version", "hardware_energy_convention", "hardware_matrix_path", "hardware_matrix_file_sha256",
     "source_problem_path", "source_problem_sha256",
     "reference_sample_path", "reference_sample_sha256", "reference_sampler",
 )
@@ -42,6 +44,13 @@ def load_matrix(matrix_file):
         if "hardware_matrix" not in archive:
             raise ValueError("%s does not contain hardware_matrix" % matrix_file)
         matrix = validate_hardware_matrix(archive["hardware_matrix"])
+        convention = str(np.asarray(archive.get(
+            "hardware_energy_convention", np.asarray(""))).reshape(-1)[0])
+        if convention != ENERGY_CONVENTION:
+            raise ValueError(
+                "Refusing Kaiwu submission: matrix is missing the corrected "
+                "SDK/model energy convention"
+            )
         expected_hash = None
         for key in ("matrix_sha256", "hardware_matrix_sha256"):
             if key in archive:
@@ -86,7 +95,9 @@ def _write_failure_evidence(output_dir, instance_id, task_name, matrix_hash,
         "status": "invalid_or_incomplete_sdk_response",
         "instance_id": str(instance_id),
         "task_name": str(task_name),
+        "platform_task_name": platform_task_name(task_name),
         "matrix_sha256": str(matrix_hash),
+        "hardware_energy_convention": ENERGY_CONVENTION,
         "stage": str(stage),
         "requested_reads": int(num_reads),
         "hardware_gain": None if hardware_gain is None else float(hardware_gain),
@@ -130,6 +141,8 @@ def submit_one(
             "checkpoint_dir is required; pass a task-specific --checkpoint-dir"
         )
     matrix, matrix_hash = load_matrix(matrix_file)
+    if frozen_task is not None and frozen_task.get("hardware_energy_convention") != ENERGY_CONVENTION:
+        raise ValueError("Frozen task is missing the corrected Kaiwu energy convention")
     task_name = task_name or build_task_name(instance_id, matrix_hash)
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -137,9 +150,12 @@ def submit_one(
     audit_path = output_dir / (str(instance_id) + ".json")
     if output_path.exists() or audit_path.exists():
         raise RuntimeError("Response artifact already exists; refusing duplicate submit or overwrite")
-    checkpoint_path = (Path(checkpoint_dir).resolve() / task_name)
-    if checkpoint_path.exists() and any(checkpoint_path.iterdir()):
-        raise RuntimeError("Task checkpoint directory is non-empty; manual review required")
+    checkpoint_root = Path(checkpoint_dir).resolve()
+    checkpoint_path = checkpoint_root / platform_task_name(task_name)
+    # Shorten new SDK cache paths, but never bypass a prior full-name cache.
+    for prior_path in {checkpoint_root / task_name, checkpoint_path}:
+        if prior_path.exists() and any(prior_path.iterdir()):
+            raise RuntimeError("Task checkpoint directory is non-empty; manual review required")
     checkpoint_path.mkdir(parents=True, exist_ok=True)
     submitted_at = datetime.now(timezone.utc).isoformat()
     try:
@@ -154,7 +170,8 @@ def submit_one(
             )
         checkpoint_manager.save_dir = str(checkpoint_path)
         result = client.sample_hardware_matrix(
-            matrix, num_reads=num_reads, task_name=task_name
+            matrix, num_reads=num_reads, task_name=task_name,
+            energy_convention=ENERGY_CONVENTION,
         )
         samples = validate_raw_hardware_spins(
             result["samples"], num_reads, matrix.shape[0]
@@ -185,7 +202,9 @@ def submit_one(
         instance_id=np.asarray(instance_id),
         task_id=np.asarray(metadata.get("task_id", "")),
         task_name=np.asarray(metadata.get("task_name", task_name)),
+        platform_task_name=np.asarray(metadata.get("platform_task_name", task_name)),
         matrix_sha256=np.asarray(matrix_hash),
+        hardware_energy_convention=np.asarray(ENERGY_CONVENTION),
         bit_order=np.asarray("index_ascending"),
         backend=np.asarray(metadata.get("backend", "kaiwu_cim_sampling")),
         sdk_version=np.asarray(sdk_version),
@@ -230,7 +249,9 @@ def submit_one(
         "instance_id": str(instance_id),
         "task_id": str(metadata.get("task_id", "")),
         "task_name": str(metadata.get("task_name", task_name)),
+        "platform_task_name": str(metadata.get("platform_task_name", task_name)),
         "matrix_sha256": matrix_hash,
+        "hardware_energy_convention": ENERGY_CONVENTION,
         "sdk_version": sdk_version,
         "sdk_versions": sdk_versions,
         "platform_backend": platform_backend,
