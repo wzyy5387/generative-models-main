@@ -73,6 +73,8 @@ def test_manual_platform_receipt_binds_id_matrix_response_and_preserves_raw(tmp_
     assert receipt["task_name"] == task_name
     assert receipt["matrix_sha256"] == matrix_hash
     assert receipt["raw_response_sha256"] == original_hash
+    assert receipt["field_sources"]["task_id"] == "platform_record." + identifier_field
+    assert "visual content is attested by reviewer" in receipt["field_sources"]["evidence_sha256"]
     checked = validate_platform_verification(raw, receipt_path, {
         "instance_id": instance, "task_id": "platform-92731",
         "task_name": task_name, "matrix_sha256": matrix_hash,
@@ -99,6 +101,27 @@ def test_manual_platform_receipt_binds_id_matrix_response_and_preserves_raw(tmp_
         "platform_identifier_value": checked["platform_identifier_value"],
     }
     assert strict_response_record_valid(record)
+
+
+def test_platform_record_screenshot_hash_must_match_supplied_evidence(tmp_path):
+    instance, _, _, matrix, raw, platform_record, evidence = _artifacts(tmp_path)
+    record = json.loads(platform_record.read_text(encoding="utf-8"))
+    record["screenshot_sha256"] = "0" * 64
+    platform_record.write_text(json.dumps(record), encoding="utf-8")
+    with pytest.raises(ValueError, match="screenshot_sha256"):
+        create_platform_verification(
+            raw, matrix, platform_record, evidence, "wsy",
+            tmp_path / (instance + ".platform_verification.json"))
+
+
+def test_receipt_batch_requires_explicit_human_review_attestation(tmp_path):
+    from GEFcom2014.models.QBM_VAE.kaiwu_platform_receipt_batch import create_vs_platform_receipts
+
+    manifest = tmp_path / "receipts.json"
+    manifest.write_text(json.dumps({"schema_version": 1, "human_review_attested": False,
+                                    "items": [{}]}), encoding="utf-8")
+    with pytest.raises(ValueError, match="reviewed by wsy"):
+        create_vs_platform_receipts(manifest, tmp_path / "unused_protocol.json", tmp_path)
 
 
 def test_platform_receipt_rejects_changed_short_name_in_raw_or_receipt(tmp_path):

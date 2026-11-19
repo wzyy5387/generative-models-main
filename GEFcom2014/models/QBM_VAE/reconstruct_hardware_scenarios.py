@@ -95,6 +95,7 @@ def decode_platform_spins(
     scale_multiplier=1.0,
     observation_noise=True,
     seed=0,
+    observation_noise_values=None,
 ):
     """Decode one condition's platform spins into shape (reads, periods)."""
     spins = np.asarray(spins, dtype=np.int8)
@@ -123,8 +124,16 @@ def decode_platform_spins(
     with torch.no_grad():
         mean, log_scale, rho = model.decode_temporal_parameters(z, context)
         if observation_noise:
-            torch.manual_seed(int(seed))
-            noise = scale_multiplier * torch.randn_like(mean)
+            if observation_noise_values is None:
+                torch.manual_seed(int(seed))
+                noise = torch.randn_like(mean)
+            else:
+                noise = torch.as_tensor(
+                    observation_noise_values, dtype=mean.dtype, device=mean.device
+                )
+                if noise.shape != mean.shape or not torch.isfinite(noise).all():
+                    raise ValueError("Paired observation noise must be finite and match the decoded trajectory shape")
+            noise = scale_multiplier * noise
             if getattr(model, "decoder_covariance", "diagonal") == "ar1":
                 residual = sample_standardized_ar_residuals(
                     noise, torch.exp(log_scale), rho
@@ -136,6 +145,41 @@ def decode_platform_spins(
             decoded = mean
     scenarios = y_scaler.inverse_transform(decoded.cpu().numpy())
     return np.clip(scenarios, 0.0, max_value)
+
+
+def decode_latent_samples_with_paired_noise(
+    model,
+    latent_spins,
+    x_cond,
+    y_scaler,
+    prediction_curves=100,
+    seed=0,
+    max_value=1.0,
+    scale_multiplier=1.0,
+):
+    """Expand each latent read into an equal number of paired noisy curves.
+
+    Rows are ordered latent-sample-major: each latent sample is repeated
+    ``prediction_curves / n_latent`` times. All methods using the same seed
+    receive the same 100-by-24 standard-normal noise matrix and row mapping.
+    """
+    latent_spins = np.asarray(latent_spins)
+    if latent_spins.ndim != 2 or latent_spins.shape[0] == 0:
+        raise ValueError("latent_spins must be a non-empty reads-by-bits matrix")
+    if (isinstance(prediction_curves, bool) or int(prediction_curves) != prediction_curves
+            or int(prediction_curves) < latent_spins.shape[0]
+            or int(prediction_curves) % latent_spins.shape[0]):
+        raise ValueError("prediction_curves must be an integer multiple of latent reads")
+    prediction_curves = int(prediction_curves)
+    generator = torch.Generator(device="cpu")
+    generator.manual_seed(int(seed))
+    noise = torch.randn((prediction_curves, 24), generator=generator, dtype=torch.float32)
+    expanded = np.repeat(latent_spins, prediction_curves // latent_spins.shape[0], axis=0)
+    return decode_platform_spins(
+        model, expanded, x_cond, y_scaler, max_value=max_value,
+        scale_multiplier=scale_multiplier, observation_noise=True,
+        observation_noise_values=noise,
+    )
 
 
 def reconstruct_scenarios(

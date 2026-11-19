@@ -6,6 +6,7 @@ from GEFcom2014.forecast_quality.opsd_cvae_comparison import (
     _load_vs_evaluation_arrays,
     _scale_ls_vs,
     diagonal_gaussian_kl,
+    validate_vs_selection_record,
 )
 
 
@@ -54,3 +55,16 @@ def test_vs_only_loader_returns_complete_dates():
     assert set(arrays) == {"x_vs", "y_vs"}
     assert set(dates) == {"vs"}
     assert arrays["x_vs"].shape[0] == arrays["y_vs"].shape[0] == len(dates["vs"]) == 90
+
+
+def test_fa_bm_score_must_match_selected_reconstruction_not_vs_total():
+    trace = [
+        {"epoch": 0, "vs_reconstruction": 1.3, "vs_total": -3.0},
+        {"epoch": 1, "vs_reconstruction": 0.8, "vs_total": 7.0},
+        {"epoch": 2, "vs_reconstruction": 1.1, "vs_total": -9.0},
+    ]
+    # Epoch 1 is selected by reconstruction even though the minimum total is epoch 2.
+    assert validate_vs_selection_record(trace, 1, 0.8) == 0.8
+    import pytest
+    with pytest.raises(ValueError, match="does not match"):
+        validate_vs_selection_record(trace, 1, -9.0)

@@ -30,7 +30,7 @@ from GEFcom2014.forecast_quality.opsd_sa_negative_evaluation import _calibrate, 
 from GEFcom2014.forecast_quality.unified_postprocessing import HourlyAffineCalibrator
 from GEFcom2014.models import probabilistic_baselines as pb
 from GEFcom2014.models.QBM_VAE import ConditionalQBMVAE, build_qbm_vae_scenarios, build_sampler, fit_qbm_vae
-from GEFcom2014.models.QBM_VAE.qbm_vae import load_frozen_graph_mask, build_generation_seed_metadata
+from GEFcom2014.models.QBM_VAE.qbm_vae import load_frozen_graph_mask, load_graph_mask_file, build_generation_seed_metadata
 from GEFcom2014.models.neso_extra_baselines import ConditionalVAE, configurations as neso_configurations, sample_cvae
 
 
@@ -49,6 +49,7 @@ VARIANTS = ("Raw", "Cal")
 METRICS = ("CRPS_raw", "Energy", "Variogram", "ramp_CRPS", "PICP90", "interval_width90", "MAQCE", "mean_bias")
 PRIMARY_COMPARISONS = (("fa_bm_vae", "standard_cvae"), ("fa_bm_vae", "fa_cvae"))
 SPLIT_OFFSETS = {"VS": 0, "TEST": 1000003}
+FA_BM_CONFIG_OVERRIDE = None
 
 
 def sha(path: Path) -> str:
@@ -247,7 +248,24 @@ def _parameter_count(model):
     return int(sum(p.numel() for p in model.parameters()))
 
 
+def validate_vs_selection_record(history, best_epoch, selection_score, selection_key="vs_reconstruction"):
+    """Fail if stored score is not the criterion value at the selected epoch."""
+    selected = [row for row in history if int(row.get("epoch", -1)) == int(best_epoch)]
+    if len(selected) != 1 or selection_key not in selected[0]:
+        raise ValueError("Missing unique validation record for selected epoch")
+    recorded = float(selection_score)
+    actual = float(selected[0][selection_key])
+    if not np.isfinite(recorded) or not np.isfinite(actual) or not np.isclose(recorded, actual, rtol=0.0, atol=1e-10):
+        raise ValueError("selection_score does not match %s at best_epoch" % selection_key)
+    return actual
+
+
 def _get_fa_bm_config():
+    if FA_BM_CONFIG_OVERRIDE is not None:
+        config = deepcopy(FA_BM_CONFIG_OVERRIDE)
+        config["dataset_bundle"] = str(BUNDLE.resolve())
+        config["test_used_for_selection"] = False
+        return config
     old = json.loads(OLD_FA_META.read_text(encoding="utf-8"))
     frozen = json.loads(FROZEN_CONFIG.read_text(encoding="utf-8"))
     config = dict(old)
@@ -418,7 +436,7 @@ def _load_fit_arrays(model):
         return tuple(np.asarray(data[k], dtype=np.float32) for k in ("x_ls", "y_ls", "x_vs", "y_vs"))
 
 
-def _train_task(model_name, seed, phase="formal"):
+def _train_task(model_name, seed, phase="formal", epochs_override=None):
     model_label = LABELS[model_name]
     output = OUT / phase / model_name / ("seed_%d" % seed)
     output.mkdir(parents=True, exist_ok=False)
@@ -429,7 +447,9 @@ def _train_task(model_name, seed, phase="formal"):
             config = _model_configs()[model_name]
             smoke = phase == "smoke"
             n_scenarios = 5 if smoke else 100
-            epochs = 1 if smoke else int(config.get("epochs", config.get("training_epochs", 80)))
+            epochs = 1 if smoke else int(epochs_override if epochs_override is not None else config.get("epochs", config.get("training_epochs", 80)))
+            if epochs_override is not None:
+                config["epochs"] = epochs
             random.seed(seed); np.random.seed(seed); torch.manual_seed(seed)
             if torch.cuda.is_available(): torch.cuda.manual_seed_all(seed)
             torch.set_num_threads(4)
@@ -476,8 +496,12 @@ def _train_task(model_name, seed, phase="formal"):
                 selection_metric = "VS Gaussian reconstruction NLL"
             else:
                 config = _get_fa_bm_config()
+                config["epochs"] = epochs
                 config["cond_in"], config["in_size"] = arrays["x_ls"].shape[1], 24
-                graph_mask = load_frozen_graph_mask(OLD_FA_CHECKPOINT, int(config["latent_s"]))
+                if config.get("graph_mask_file"):
+                    graph_mask = load_graph_mask_file(Path(config["graph_mask_file"]), int(config["latent_s"]))
+                else:
+                    graph_mask = load_frozen_graph_mask(OLD_FA_CHECKPOINT, int(config["latent_s"]))
                 model = _build_bm_model(config, graph_mask, device)
                 opt = torch.optim.Adam(model.parameters(), lr=float(config["learning_rate"]),
                                        weight_decay=float(config["weight_decay"]))
@@ -495,13 +519,18 @@ def _train_task(model_name, seed, phase="formal"):
                     temperature_start=float(config["temperature_start"]),
                     temperature_end=float(config["temperature_end"]), grad_clip=5.0, seed=seed,
                     evaluate_test_during_training=False, negative_sampler=negative_sampler,
-                    negative_num_reads=int(config["negative_num_reads"]))
+                    negative_num_reads=int(config["negative_num_reads"]),
+                    temperature_schedule_epochs=config.get("temperature_schedule_epochs"))
                 fit_seconds = time.perf_counter() - started_fit
                 model = best_model
-                history = [{"epoch": i, "training_loss": float(row[0]), "vs_total": float(row[1]),
-                            "test_loss": None} for i, row in enumerate(loss)]
+                validation_history = list(model.validation_history)
+                if len(validation_history) != len(loss):
+                    raise ValueError("VS reconstruction history length differs from training history")
+                history = [dict(validation_history[i], training_loss=float(row[0]), test_loss=None)
+                           for i, row in enumerate(loss)]
                 best_epoch = int(model.selection_epoch)
-                selection_score = float(min(row["vs_total"] for row in history))
+                selection_score = float(model.selection_score)
+                validate_vs_selection_record(history, best_epoch, selection_score)
                 selection_metric = "VS Gaussian reconstruction NLL (negative phase disabled for validation)"
                 checkpoint = model
             with (output / "checkpoint.pickle").open("wb") as handle:

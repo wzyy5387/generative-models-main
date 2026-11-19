@@ -50,10 +50,25 @@ def validate_protocol(protocol):
     hardware = protocol["hardware"]
     if hardware["candidate_gains"] != [125, 150, 200]:
         raise ValueError("Gain grid is frozen to [125, 150, 200]")
-    if hardware["reads_per_instance"] != 100:
-        raise ValueError("Reads per instance must be 100")
-    if protocol.get("gain_selection", {}).get("read_convergence") != [50, 100]:
-        raise ValueError("VS read sensitivity is frozen to overlapping [50, 100] prefixes")
+    reads = int(hardware["reads_per_instance"])
+    if reads not in (10, 100):
+        raise ValueError("Reads per task must be 10 or 100")
+    inference = protocol.get("inference", {})
+    if reads == 10 and not inference:
+        raise ValueError("10-read protocol must declare latent samples and prediction curves separately")
+    if inference:
+        if int(inference.get("latent_samples_per_date", -1)) != reads:
+            raise ValueError("Inference latent sample count must match hardware reads")
+        curves = int(inference.get("prediction_curves_per_date", -1))
+        if curves != 100 or curves % reads:
+            raise ValueError("Inference must generate 100 prediction curves from an integer number per latent sample")
+        if reads == 10 and inference.get("noise_pairing") != "same_seeded_row_major_100x24_for_all_methods":
+            raise ValueError("10-read inference requires the frozen paired-noise mapping")
+    convergence = protocol.get("gain_selection", {}).get("read_convergence")
+    if reads == 100 and convergence != [50, 100]:
+        raise ValueError("100-read VS sensitivity is frozen to overlapping [50, 100] prefixes")
+    if reads == 10 and convergence not in (None, []):
+        raise ValueError("10-read inference cannot claim the 50/100 latent-read diagnostic")
     if protocol["dataset"]["selection_seed"] != 2026:
         raise ValueError("Selection seed must be 2026")
     if protocol["dataset"]["test_peeking"] is not False:
@@ -316,17 +331,46 @@ def _recompute_response_metrics(record, target_beta=1.0, require_reference_prove
                 matches = str(actual) == str(expected)
             if not matches:
                 raise ValueError("VS reference sample provenance mismatch: %s" % key)
-    if (reference_samples.shape != (100, h.size)
+    # A versioned historical-prefix panel record keeps the source task's real
+    # 100/100 counts while comparing exactly ten analysis rows. Other records
+    # retain the existing physical/legacy semantics.
+    derived_prefix = record.get("record_kind") == "historical_100read_task_prefix_first10"
+    requested_reads = record.get("requested_reads")
+    returned_reads = record.get("returned_reads")
+    if require_reference_provenance and (requested_reads is None or returned_reads is None):
+        raise ValueError("Formal VS response lacks requested/returned read counts")
+    sampler_reads = int(sampler.get("reads", reference_samples.shape[0]))
+    if (reference_samples.shape != (sampler_reads, h.size)
             or not np.isin(reference_samples, (-1, 1)).all()):
         raise ValueError("Frozen VS reference samples have the wrong logical dimension")
-    metrics = compare_response_pair(h, j, reference_samples, logical)
-    read_convergence = compare_read_convergence(h, j, reference_samples, logical)
+    if derived_prefix:
+        expected_reads = int(record.get("analysis_reads", -1))
+        if (expected_reads != 10 or int(requested_reads) != 100
+                or int(returned_reads) != 100
+                or int(record.get("source_requested_reads", -1)) != 100
+                or int(record.get("source_returned_reads", -1)) != 100):
+            raise ValueError("Historical-prefix record must preserve 100/100 source reads and analyze ten rows")
+        reference_for_metrics = reference_samples[:expected_reads]
+    else:
+        expected_reads = (int(requested_reads) if requested_reads is not None
+                          else int(reference_samples.shape[0]))
+        if reference_samples.shape[0] != expected_reads:
+            raise ValueError("Frozen VS reference sample count does not match the task")
+        reference_for_metrics = reference_samples
+    if (logical.shape != (expected_reads, h.size)
+            or (not derived_prefix and returned_reads is not None
+                and int(returned_reads) != logical.shape[0])):
+        raise ValueError("VS response sample count does not match the frozen task")
+    metrics = compare_response_pair(h, j, reference_for_metrics, logical)
+    read_convergence = (compare_read_convergence(h, j, reference_samples, logical)
+                        if expected_reads >= 100 else None)
     metrics["effective_beta_error"] = abs(float(metrics["candidate_beta_eff"]) - float(target_beta))
     metrics["unique_state_fraction"] = float(metrics["candidate_unique_state_fraction"])
     result = {key: float(metrics[key]) for key in (
         "energy_wasserstein", "effective_beta_error", "edge_moment_mae",
         "magnetization_mae", "unique_state_fraction")}
-    result["read_convergence_diagnostics"] = read_convergence
+    if read_convergence is not None:
+        result["read_convergence_diagnostics"] = read_convergence
     if not np.isfinite([value for value in result.values()
                         if isinstance(value, (int, float, np.integer, np.floating))]).all():
         raise ValueError("VS recomputed calibration metrics are non-finite")
@@ -373,6 +417,7 @@ def aggregate_gain_metrics(response_records, recompute=False, prediction_inputs=
                 {"instance_id": item["instance_id"],
                  **item["prediction_read_sensitivity"]}
                 for item in daily
+                if item["prediction_read_sensitivity"] is not None
             ]
     return rows
 
@@ -556,7 +601,13 @@ def validate_vs_response_records(response_records, required_gains,
         if expected_ids is not None and instance_id not in expected_ids:
             raise ValueError("VS response contains a condition outside the frozen VS panel")
         expected = expected_task_map.get(key) if expected_task_map else None
-        if not strict_response_record_valid(record, expected, require_physical=require_physical):
+        if record.get("record_kind") == "historical_100read_task_prefix_first10":
+            from .kaiwu_panel_revision import validate_historical_panel_record
+            valid = expected is not None and validate_historical_panel_record(
+                record, expected, require_physical=require_physical)
+        else:
+            valid = strict_response_record_valid(record, expected, require_physical=require_physical)
+        if not valid:
             raise ValueError("VS response failed raw task, metadata, hash, shape, or read validation")
         if expected_identity:
             for field, value in expected_identity.items():

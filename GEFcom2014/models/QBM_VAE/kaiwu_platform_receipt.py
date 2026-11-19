@@ -89,6 +89,9 @@ def create_platform_verification(raw_response, matrix_file, platform_record,
     platform_id = str(record.get(platform_id_key, "")).strip()
     if not platform_id:
         raise ValueError("Platform task record must contain a real task_id or job_id")
+    if (record.get("screenshot_sha256")
+            and str(record["screenshot_sha256"]) != sha256_file(evidence_file)):
+        raise ValueError("Platform record screenshot_sha256 does not match the supplied evidence file")
 
     with np.load(raw_response, allow_pickle=False) as archive:
         required = ("samples", "instance_id", "task_name", "matrix_sha256",
@@ -169,6 +172,20 @@ def create_platform_verification(raw_response, matrix_file, platform_record,
         "platform_record_sha256": sha256_file(platform_record),
         "evidence_path": str(evidence_file),
         "evidence_sha256": sha256_file(evidence_file),
+        "field_sources": {
+            "task_id": "platform_record." + platform_id_key,
+            "task_name": "platform_record.task_name; cross-checked against frozen response",
+            "status": "platform_record.status",
+            "requested_reads": "platform_record.requested_reads; cross-checked against frozen response",
+            "returned_reads": "platform_record.returned_reads; cross-checked against saved response rows",
+            "submitted_at": "platform_record.submitted_at (platform event)",
+            "completed_at": "platform_record.completed_at (platform event)",
+            "matrix_sha256": "platform_record.matrix_sha256; cross-checked against frozen matrix",
+            "response_sha256": "local SDK response file bytes",
+            "matrix_file_sha256": "local frozen matrix file bytes",
+            "evidence_sha256": "supplied screenshot/evidence file bytes; visual content is attested by reviewer",
+            "verified_by": "explicit operator input",
+        },
         "verified_by": str(verified_by).strip(),
         "verified_at": datetime.now(timezone.utc).isoformat(),
     }
@@ -249,6 +266,9 @@ def validate_platform_verification(raw_response, verification_path, expected=Non
     for key, value in platform_fields.items():
         if str(platform_record.get(key)) != str(value):
             raise ValueError("Platform verification differs from source task record: %s" % key)
+    if (platform_record.get("screenshot_sha256")
+            and str(platform_record["screenshot_sha256"]) != str(receipt.get("evidence_sha256"))):
+        raise ValueError("Platform record screenshot hash differs from receipt evidence")
     for receipt_key, record_key in (("platform_submitted_at", "submitted_at"),
                                     ("platform_completed_at", "completed_at")):
         if not _same_instant(receipt.get(receipt_key), platform_record.get(record_key), receipt_key):

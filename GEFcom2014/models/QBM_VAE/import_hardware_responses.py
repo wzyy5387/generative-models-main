@@ -9,7 +9,7 @@ from pathlib import Path
 
 import numpy as np
 
-from .prepare_bosonic_submission import sha256_file
+from .prepare_bosonic_submission import resolve_repo_path, sha256_file
 from .kaiwu_adapter import normalize_hardware_spins
 
 
@@ -177,6 +177,21 @@ def strict_response_record_valid(record, expected=None, require_physical=True):
                     if float(record.get(key)) != float(expected_value):
                         return False
                 except (TypeError, ValueError):
+                    return False
+            elif key == "hardware_matrix_path":
+                try:
+                    record_path = resolve_repo_path(record.get(key, ""))
+                    expected_path = resolve_repo_path(expected_value)
+                    if (not record_path.is_file() or not expected_path.is_file()
+                            or record_path.resolve() != expected_path.resolve()):
+                        return False
+                    expected_file_hash = str(expected.get("hardware_matrix_file_sha256", ""))
+                    record_file_hash = str(record.get("hardware_matrix_file_sha256", ""))
+                    if (not expected_file_hash or not record_file_hash
+                            or expected_file_hash != record_file_hash
+                            or sha256_file(record_path) != expected_file_hash):
+                        return False
+                except (OSError, TypeError, ValueError):
                     return False
             elif str(record.get(key, "")) != str(expected_value):
                 return False

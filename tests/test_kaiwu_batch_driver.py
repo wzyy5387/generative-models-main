@@ -616,6 +616,47 @@ def test_strict_response_rejects_missing_hash_reads_and_mock(tmp_path):
         assert not strict_response_record_valid(bad)
     bad = dict(record); bad["returned_reads"] = 9
     assert not strict_response_record_valid(bad)
+
+
+def test_strict_response_accepts_equivalent_matrix_paths_but_checks_file_identity(tmp_path):
+    import numpy as np
+    from GEFcom2014.models.QBM_VAE.prepare_bosonic_submission import sha256_file
+
+    matrix = tmp_path / "matrix.npz"
+    other_matrix = tmp_path / "other_matrix.npz"
+    np.savez_compressed(matrix, hardware_matrix=np.zeros((49, 49), dtype=np.int8))
+    np.savez_compressed(other_matrix, hardware_matrix=np.ones((49, 49), dtype=np.int8))
+    response = tmp_path / "response.npz"
+    np.savez_compressed(
+        response, samples=np.ones((10, 49), dtype=np.int8), instance_id="i",
+        task_id="tid", task_name="tn", matrix_sha256="mh", stage="vs",
+        hardware_gain=150, requested_reads=10, returned_reads=10,
+    )
+    record = {
+        "completed": True, "instance_id": "i", "stage": "vs", "task_id": "tid",
+        "task_name": "tn", "matrix_sha256": "mh",
+        "response_file_sha256": sha256_file(response), "requested_reads": 10,
+        "returned_reads": 10, "response_path": str(response), "gain": 150,
+        "sdk_version": "1.0.7", "platform_backend": "kaiwu.cim.CIMOptimizer",
+        "submitted_at": "2026-01-01T00:00:00+00:00",
+        "completed_at": "2026-01-01T00:01:00+00:00",
+        "hardware_metadata_complete": True, "hardware_claim": True,
+        "physical_platform_used": True,
+        "sdk_versions": {"importlib_metadata_version": "1.4.1", "kaiwu_module_version": "1.0.7"},
+        "hardware_matrix_path": str(matrix.resolve()),
+        "hardware_matrix_file_sha256": sha256_file(matrix),
+    }
+    expected = {"hardware_matrix_path": str(matrix),
+                "hardware_matrix_file_sha256": sha256_file(matrix)}
+    assert strict_response_record_valid(record, expected)
+
+    assert not strict_response_record_valid(
+        {**record, "hardware_matrix_path": str(other_matrix.resolve())}, expected)
+    assert not strict_response_record_valid(
+        record, {**expected, "hardware_matrix_file_sha256": "0" * 64})
+    assert not strict_response_record_valid(
+        record, {"hardware_matrix_path": str(tmp_path / "missing.npz"),
+                 "hardware_matrix_file_sha256": sha256_file(matrix)})
     bad = dict(record); bad["hardware_claim"] = False
     assert not strict_response_record_valid(bad)
 

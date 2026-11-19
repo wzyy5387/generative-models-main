@@ -27,6 +27,7 @@ from .submit_kaiwu_sampling import submit_one, FROZEN_TASK_AUDIT_FIELDS
 
 
 ROOT_DIR = Path(__file__).resolve().parents[3]
+DEFAULT_HISTORICAL_PREFIX_AMENDMENT = ROOT_DIR / "export" / "opsd_sa_negative_kaiwu_historical_prefix_v3"
 DEFAULT_PREPARATION = ROOT_DIR / "export" / "opsd_sa_negative_kaiwu_preparation_v8"
 DEFAULT_PROTOCOL = ROOT_DIR / "configs" / "paper" / "fa_bm_vae_opsd_sa_negative_kaiwu_protocol.json"
 
@@ -161,6 +162,7 @@ def _vs_tasks(preparation, protocol=None):
                           "date": str(item["date"]),
                           "matrix": matrix, "matrix_sha256": item["hardware_matrix_sha256"],
                           "hardware_matrix_path": str(matrix),
+                          "hardware_matrix_file_sha256": item["hardware_matrix_sha256_file"],
                            "hardware_energy_convention": platform_payload.get("hardware_energy_convention", ""),
                           "source_problem_path": platform_payload.get("source_problem_path", ""),
                           "source_problem_sha256": platform_payload.get("source_problem_sha256", ""),
@@ -396,8 +398,24 @@ def select_pending_tasks(tasks, completed, limit=None):
     return pending if limit is None else pending[:max(0, int(limit))]
 
 
+def _select_exact_vs_task(tasks, instance_id, gain, expected_reads,
+                          expected_matrix_sha256=None):
+    """Select and verify exactly one already-frozen VS task."""
+    selected = [item for item in tasks
+                if str(item.get("instance_id")) == str(instance_id)
+                and float(item.get("gain")) == float(gain)]
+    if len(selected) != 1:
+        raise RuntimeError("Task selection must identify exactly one frozen VS task")
+    task = selected[0]
+    if int(task.get("reads", -1)) != int(expected_reads):
+        raise RuntimeError("Selected task reads do not match the frozen protocol")
+    if expected_matrix_sha256 is not None and str(task.get("matrix_sha256", "")) != str(expected_matrix_sha256):
+        raise RuntimeError("Selected task matrix SHA-256 does not match the requested frozen matrix")
+    return [task]
+
+
 def _restrict_canary_tasks(tasks, args, protocol):
-    """Restrict the first real probe to one frozen VS condition and gain 125."""
+    """Restrict a canary to one explicitly identified frozen VS task."""
     if getattr(args, "canary", False) and getattr(args, "confirm_batch", False):
         raise RuntimeError("Choose canary or batch approval, not both")
     if getattr(args, "confirm_canary", False) and not getattr(args, "canary", False):
@@ -413,14 +431,33 @@ def _restrict_canary_tasks(tasks, args, protocol):
     if args.execute and not getattr(args, "confirm_canary", False):
         raise RuntimeError("Canary execution requires explicit --confirm-canary")
     expected_reads = int(protocol.get("hardware", {}).get("reads_per_instance", 100))
-    selected = [item for item in tasks
-                if str(item.get("instance_id")) == str(args.canary_instance_id)
-                and float(item.get("gain")) == 125.0]
-    if len(selected) != 1:
-        raise RuntimeError("Canary condition is not exactly one frozen gain-125 VS task")
-    if int(selected[0]["reads"]) != expected_reads or expected_reads != 100:
-        raise RuntimeError("Canary requires the frozen 100-read VS protocol")
-    return selected
+    ten_read = expected_reads == 10
+    gain = getattr(args, "canary_gain", None)
+    matrix_hash = getattr(args, "canary_matrix_sha256", None)
+    if ten_read and (gain is None or matrix_hash is None):
+        raise RuntimeError("10-read canary requires explicit --canary-gain and --canary-matrix-sha256")
+    if gain is None:
+        gain = 125
+    if expected_reads not in (10, 100):
+        raise RuntimeError("Canary protocol must freeze either 10 or 100 reads")
+    return _select_exact_vs_task(
+        tasks, args.canary_instance_id, gain, expected_reads, matrix_hash)
+
+
+def _restrict_dry_run_task(tasks, args, protocol=None):
+    instance_id = getattr(args, "dry_run_instance_id", None)
+    gain = getattr(args, "dry_run_gain", None)
+    matrix_hash = getattr(args, "dry_run_matrix_sha256", None)
+    if instance_id is None and gain is None and matrix_hash is None:
+        return tasks
+    if args.execute or not args.dry_run or args.stage != "vs":
+        raise RuntimeError("Explicit task selection is available only for VS dry-runs")
+    if instance_id is None or gain is None:
+        raise RuntimeError("VS dry-run selection requires both --dry-run-instance-id and --dry-run-gain")
+    expected_reads = int((protocol or {}).get("hardware", {}).get("reads_per_instance", 10))
+    if protocol is not None and expected_reads == 10 and matrix_hash is None:
+        raise RuntimeError("10-read VS dry-run requires --dry-run-matrix-sha256")
+    return _select_exact_vs_task(tasks, instance_id, gain, expected_reads, matrix_hash)
 
 
 def _deterministic_task_name(task, protocol_id):
@@ -445,10 +482,17 @@ def _validated_records_for_tasks(tasks, records):
     for task in tasks:
         expected = _task_expected(task)
         matches = [record for record in records
-                   if strict_response_record_valid(record, expected)]
+                   if _response_record_matches_task(record, expected)]
         if matches:
             validated.append(matches[0])
     return validated
+
+
+def _response_record_matches_task(record, expected, require_physical=True):
+    if record.get("record_kind") == "historical_100read_task_prefix_first10":
+        from .kaiwu_panel_revision import validate_historical_panel_record
+        return validate_historical_panel_record(record, expected, require_physical=require_physical)
+    return strict_response_record_valid(record, expected, require_physical=require_physical)
 
 
 def _validate_execution_limits(tasks):
@@ -485,6 +529,40 @@ def _validate_execution_limits(tasks):
                 raise RuntimeError("Real execution refuses a stale-sign or unmarked hardware matrix")
             if matrix_sha256(matrix) != instance.get("hardware_matrix_sha256"):
                 raise RuntimeError("Frozen matrix SHA-256 mismatch")
+
+
+def _guard_historical_prefix_resubmission(tasks, amendment_path):
+    """Fail closed when a known paid historical source maps to a planned task.
+
+    The base 10-read protocol cannot count this derived artifact. Until a
+    reviewed panel amendment is integrated into its full validation path, do
+    not let the old physical condition be submitted again.
+    """
+    amendment_path = Path(amendment_path)
+    legacy_instance = "opsd-wind_opsd-wind_QBMVAE_2_anchor_sa_neg_sa_0_vs_000"
+    legacy_matrix = "0487ba43a0865f4d721f2ac435fb77eb1ba99638625448c944fee6fcd79d6265"
+    overlaps = [task for task in tasks
+                if str(task.get("instance_id")) == legacy_instance
+                and float(task.get("gain", -1)) == 125.0
+                and str(task.get("matrix_sha256")) == legacy_matrix]
+    if not overlaps:
+        return
+    if not amendment_path.exists():
+        raise RuntimeError(
+            "Paid historical task b1331cc8139e4395a72e2562db61015d matches this VS condition; "
+            "its source reconciliation is missing, so no intent or SDK submission was made.")
+    from .derive_historical_kaiwu_prefix import validate_bundle
+    amendment = validate_bundle(amendment_path)
+    target = amendment["new_panel_entry"]
+    if (amendment["source_physical_task"]["task_id"] != "b1331cc8139e4395a72e2562db61015d"
+            or str(target["instance_id"]) != legacy_instance
+            or str(target["target_matrix_content_sha256"]) != legacy_matrix):
+        raise RuntimeError("Historical prefix amendment does not match the fixed paid-task identity")
+    raise RuntimeError(
+        "Paid historical 100-read task b1331cc8139e4395a72e2562db61015d matches this planned VS condition. "
+        "The 10-read base protocol does not recognize its derived prefix; "
+        "no intent or SDK submission was made. Freeze and integrate an explicit "
+        "protocol amendment before continuing this condition.")
 
 
 def _load_frozen_gain(preparation, protocol=None, allow_offline=False, offline_freeze_path=None):
@@ -585,8 +663,27 @@ def _atomic_json(path, payload):
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
     temporary = path.with_suffix(path.suffix + ".tmp")
-    temporary.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+    def encode_path(value):
+        if isinstance(value, os.PathLike):
+            return os.fspath(value)
+        raise TypeError("Object of type %s is not JSON serializable" % type(value).__name__)
+    temporary.write_text(json.dumps(payload, indent=2, default=encode_path), encoding="utf-8")
     os.replace(temporary, path)
+
+
+def _audit_record_copy(record):
+    """Remove process-local trust tokens before persisting an audit record."""
+    return {key: value for key, value in record.items() if not str(key).startswith("_")}
+
+
+def _intent_path(checkpoint_dir, task_name):
+    """Keep intent filenames readable unless Windows path length needs room."""
+    root = Path(checkpoint_dir)
+    full_path = root / (str(task_name) + ".intent.json")
+    if len(str(full_path)) <= 240:
+        return full_path
+    digest = hashlib.sha256(str(task_name).encode("utf-8")).hexdigest()[:32]
+    return root / (digest + ".intent.json")
 
 
 def _load_pending_intents(checkpoint_dir):
@@ -600,7 +697,9 @@ def _load_pending_intents(checkpoint_dir):
                     "matrix_sha256", "requested_reads", "created_at", "state")
         if not isinstance(payload, dict) or any(key not in payload for key in required):
             raise RuntimeError("Existing task intent lacks required identity fields: %s" % path)
-        if (path.name != str(payload["task_name"]) + ".intent.json"
+        task_name = str(payload["task_name"])
+        short_name = _intent_path(checkpoint_dir, task_name).name
+        if (path.name not in (task_name + ".intent.json", short_name)
                 or payload["stage"] not in ("vs", "test")
                 or payload["state"] not in ("pending", "completed", "validation_failed")
                 or not str(payload["instance_id"]).strip()
@@ -682,8 +781,8 @@ def _validate_vs_experiment_responses(tasks, records, preparation, protocol,
         candidates = []
         for record in associated:
             try:
-                if not strict_response_record_valid(record, expected,
-                                                    require_physical=require_physical):
+                if not _response_record_matches_task(record, expected,
+                                                     require_physical=require_physical):
                     raise ValueError("Existing VS response identity/read validation failed")
             except Exception as exc:
                 raise VSResponseValidationError(str(exc), task, record) from exc
@@ -763,7 +862,10 @@ def _record_validation_failure(output_dir, checkpoint_dir, task, record, error):
         })
     task_name = task.get("task_name") if task else None
     if task_name:
-        intent_path = checkpoint_dir / (str(task_name) + ".intent.json")
+        intent_path = _intent_path(checkpoint_dir, task_name)
+        legacy_path = Path(checkpoint_dir) / (str(task_name) + ".intent.json")
+        if not intent_path.exists() and legacy_path.exists():
+            intent_path = legacy_path
         if intent_path.is_file():
             try:
                 intent = json.loads(intent_path.read_text(encoding="utf-8"))
@@ -1002,12 +1104,27 @@ def run(args):
             validate_vs_execution_order(
                 order_path, all_tasks, identity["protocol_sha256"],
                 identity["preparation_manifest_sha256"])
+    # Validate an explicit panel addendum against the complete frozen VS
+    # panel, even when this invocation is narrowed to one canary/task.
+    frozen_panel_tasks = list(all_tasks) if args.stage == "vs" else []
+    all_tasks = _restrict_dry_run_task(all_tasks, args, protocol)
     all_tasks = _restrict_canary_tasks(all_tasks, args, protocol)
+    panel_revision_path = getattr(args, "panel_revision", None)
+    if (args.execute and args.stage == "vs" and panel_revision_path is None
+            and int(protocol.get("hardware", {}).get("reads_per_instance", 0)) == 10):
+        _guard_historical_prefix_resubmission(
+            all_tasks, getattr(args, "historical_prefix_amendment",
+                               DEFAULT_HISTORICAL_PREFIX_AMENDMENT))
     # Load once. A physical task may be complete while its experimental
     # response is still unvalidated; do not skip or advance its intent yet.
     audit_records = _load_audit_records(output_dir)
     recovered_records = []
     intents = _load_pending_intents(checkpoint_dir)
+    if panel_revision_path is not None:
+        from .kaiwu_panel_revision import load_historical_panel_records
+        audit_records.extend(load_historical_panel_records(
+            panel_revision_path, frozen_panel_tasks, protocol, preparation,
+            output_dir=output_dir, intents=intents, existing_records=audit_records))
     if args.execute:
         awaiting = [record for record in audit_records
                     if record.get("status") == "awaiting_platform_verification"
@@ -1015,7 +1132,8 @@ def run(args):
         if awaiting:
             raise RuntimeError("Saved response is awaiting platform identity verification; no retry or further submission: %s"
                                % awaiting[0].get("verification_receipt_expected", "receipt path unavailable"))
-    completed_records = _validated_records_for_tasks(all_tasks, audit_records)
+    validation_tasks = frozen_panel_tasks if args.stage == "vs" else all_tasks
+    completed_records = _validated_records_for_tasks(validation_tasks, audit_records)
     completed_keys = {(str(record["instance_id"]), str(record["matrix_sha256"]))
                       for record in completed_records}
     if args.execute:
@@ -1024,14 +1142,14 @@ def run(args):
         if args.stage == "vs" and prediction_quality_mode(protocol.get("gain_selection", {}).get("quality_gate")):
             try:
                 completed_records = _validate_vs_experiment_responses(
-                    all_tasks, audit_records, preparation, protocol)
+                    validation_tasks, audit_records, preparation, protocol)
             except Exception as exc:
                 failure_path = _record_validation_failure(
                     output_dir, checkpoint_dir, None, {}, exc)
                 raise RuntimeError("Existing VS response failed full validation before submission; batch stopped: %s" % failure_path) from exc
             completed_keys = {(str(record["instance_id"]), str(record["matrix_sha256"]))
                               for record in completed_records}
-        for task in all_tasks:
+        for task in validation_tasks:
             key = (str(task["instance_id"]), str(task["matrix_sha256"]))
             task_name = _deterministic_task_name(task, protocol.get("protocol_version"))
             intent_entry = intents.get(task_name)
@@ -1069,18 +1187,18 @@ def run(args):
             if args.stage == "vs" and prediction_quality_mode(protocol.get("gain_selection", {}).get("quality_gate")):
                 try:
                     completed_records = _validate_vs_experiment_responses(
-                        all_tasks, audit_records, preparation, protocol)
+                        validation_tasks, audit_records, preparation, protocol)
                 except Exception as exc:
                     failure_path = _record_validation_failure(
                         output_dir, checkpoint_dir, None, {}, exc)
                     raise RuntimeError("Recovered VS response failed full validation; batch stopped: %s" % failure_path) from exc
             else:
-                completed_records = _validated_records_for_tasks(all_tasks, audit_records)
+                completed_records = _validated_records_for_tasks(validation_tasks, audit_records)
             completed_keys = {(str(record["instance_id"]), str(record["matrix_sha256"]))
                               for record in completed_records}
         # Intent completion follows full experiment validation, never receipt
         # validation alone.
-        for task in all_tasks:
+        for task in validation_tasks:
             task_name = _deterministic_task_name(task, protocol.get("protocol_version"))
             intent_entry = intents.get(task_name)
             key = (str(task["instance_id"]), str(task["matrix_sha256"]))
@@ -1102,18 +1220,22 @@ def run(args):
                 "physical_platform_used": False, "dry_run": True}
     audit_path = output_dir / (args.stage + "_batch_audit.json")
     if not tasks:
-        validated = completed_records
+        selected_keys = {(str(task["instance_id"]), str(task["matrix_sha256"]))
+                         for task in all_tasks}
+        validated = [record for record in completed_records
+                     if (str(record["instance_id"]), str(record["matrix_sha256"])) in selected_keys]
         complete = bool(all_tasks) and len(validated) == len(all_tasks)
         pending_count = len(all_tasks) - len(validated)
         if validated:
-            _atomic_json(audit_path, {"stage": args.stage, "records": validated,
-                "completed": len(validated), "skipped_validated": len(completed),
+            _atomic_json(audit_path, {"stage": args.stage,
+                "records": [_audit_record_copy(record) for record in validated],
+                "completed": len(validated), "skipped_validated": len(validated),
                 "pending": len(all_tasks) - len(validated),
                 "requested_reads": sum(item["reads"] for item in all_tasks),
                 "returned_reads": sum(int(r["returned_reads"]) for r in validated),
                 "hardware_claim": complete, "physical_platform_used": complete})
         return {"stage": args.stage, "completed": len(validated),
-                "skipped_validated": len(completed), "pending": pending_count,
+                "skipped_validated": len(validated), "pending": pending_count,
                 "requested_reads": sum(item["reads"] for item in all_tasks),
                 "returned_reads": sum(int(r["returned_reads"]) for r in validated), "hardware_claim": complete,
                 "physical_platform_used": complete}
@@ -1137,7 +1259,7 @@ def run(args):
         response_dir = output_dir / ("gain_%d" % item["gain"])
         task_name = _deterministic_task_name(item, protocol.get("protocol_version"))
         checkpoint_dir.mkdir(parents=True, exist_ok=True)
-        intent_path = checkpoint_dir / (task_name + ".intent.json")
+        intent_path = _intent_path(checkpoint_dir, task_name)
         intent_path.parent.mkdir(parents=True, exist_ok=True)
         intent_payload = {
             "task_name": task_name, "stage": args.stage, "instance_id": item["instance_id"],
@@ -1227,7 +1349,8 @@ def run(args):
         validated = completed_records
         completed_count = len(validated)
         returned_total = sum(int(r.get("returned_reads", 0)) for r in validated)
-        _atomic_json(audit_path, {"stage": args.stage, "records": validated,
+        _atomic_json(audit_path, {"stage": args.stage,
+            "records": [_audit_record_copy(record) for record in validated],
             "completed": completed_count,
             "skipped_validated": len(completed),
             "pending": len(all_tasks) - completed_count,
@@ -1254,6 +1377,11 @@ def main():
     parser.add_argument("--preparation", type=Path, default=DEFAULT_PREPARATION)
     parser.add_argument("--output-dir", type=Path, default=DEFAULT_PREPARATION / "real_responses")
     parser.add_argument("--checkpoint-dir", type=Path, default=DEFAULT_PREPARATION / "checkpoints")
+    parser.add_argument("--historical-prefix-amendment", type=Path,
+                        default=DEFAULT_HISTORICAL_PREFIX_AMENDMENT,
+                        help="Block resubmission of a paid historical task whose prefix has not been frozen into this panel")
+    parser.add_argument("--panel-revision", type=Path, default=None,
+                        help="Opt into an explicit hash-bound VS panel addendum")
     parser.add_argument("--limit", type=int, default=None)
     parser.add_argument("--resume", action="store_true")
     parser.add_argument("--dry-run", action="store_true", help="Default; print plan without SDK calls")
@@ -1274,8 +1402,18 @@ def main():
                         help="Separate explicit approval to submit the frozen TEST stage")
     parser.add_argument("--canary-instance-id", default=None,
                         help="Exact frozen VS instance ID used by --canary")
+    parser.add_argument("--canary-gain", type=float, default=None,
+                        help="Exact frozen gain for --canary (required by 10-read protocols)")
+    parser.add_argument("--canary-matrix-sha256", default=None,
+                        help="Exact frozen matrix SHA-256 for --canary (required by 10-read protocols)")
     parser.add_argument("--vs-order-manifest", type=Path, default=None,
                         help="Separate pre-frozen date-interleaved VS execution order")
+    parser.add_argument("--dry-run-instance-id", default=None,
+                        help="Select one exact VS instance for an offline dry-run")
+    parser.add_argument("--dry-run-gain", type=float, default=None,
+                        help="Select one frozen gain together with --dry-run-instance-id")
+    parser.add_argument("--dry-run-matrix-sha256", default=None,
+                        help="Require the selected frozen matrix SHA-256 (required by 10-read protocols)")
     args = parser.parse_args()
     if args.dry_run and args.execute:
         raise SystemExit("Choose only one of --dry-run and --execute")
